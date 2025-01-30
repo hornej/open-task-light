@@ -1,0 +1,20 @@
+----------------------------------------------------------------------------------------------------------------------------------
+NCDrill File Report For: DIYson.PcbDoc   1/4/2025  4:10:01 PM
+----------------------------------------------------------------------------------------------------------------------------------
+
+Layer Pair : Top Layer to Bottom Layer
+ASCII RoundHoles File : DIYson.TXT
+
+Tool       Hole Size               Hole Tolerance               Hole Type       Hole Count   Plated         Tool Travel
+----------------------------------------------------------------------------------------------------------------------------------
+T1      12mil (0.3mm)                                             Round             147       PTH        19.70inch (500.50mm)
+T2      12mil (0.305mm)                                           Round             27        PTH        2.20inch (55.83mm)
+T3      20mil (0.5mm)                                             Round             2         PTH        0.05inch (1.20mm)
+T4      28mil (0.7mm)                                             Round             2         PTH        0.23inch (5.78mm)
+T5      122mil (3.1mm)                                            Round             2         PTH        1.38inch (35.00mm)
+T6      166mil (4.22mm)                                           Round             2         PTH        1.38inch (35.00mm)
+T7      28mil (0.7mm)                                             Round             4         NPTH       0.47inch (11.84mm)
+----------------------------------------------------------------------------------------------------------------------------------
+Totals                                                                              186
+
+Total Processing Time (hh:mm:ss) : 00:00:00
