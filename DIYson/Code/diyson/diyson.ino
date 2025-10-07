@@ -27,6 +27,9 @@ const uint8_t ws2812Pin = 40;  // WS2812 data pin
 bool ignoreRepeats = true;
 uint32_t startTime = 0;
 
+// Use / disable the addressable LED at runtime
+bool ws2812Enabled = false;
+
 // Add state variables for press-and-hold and double-tap detection
 bool lastSwitchUpState = false;
 bool lastSwitchDnState = false;
@@ -42,10 +45,26 @@ const unsigned long doubleTapInterval = 300;  // Max time for a double-tap in mi
 const unsigned long dimholdDelay = 8;        // Time to wait before considering a hold
 const unsigned long tempholdDelay = 5;
 
+// Quad-tap tracking for the on/off touch key
+uint8_t ledTapCount = 0;
+unsigned long ledLastTapTime = 0;
+const unsigned long multiTapInterval = 400; // ms gap allowed between taps
+
+// Long-hold detection for ON/OFF pad (only when turning ON)
+unsigned long ledHoldStart     = 0;
+bool          ledHoldArmed     = false;
+bool          wsHoldFired      = false;
+const unsigned long ws2812ToggleHoldMs = 3000; // 3 seconds
+
 unsigned long switchUpHoldStart = 0;
 unsigned long switchDnHoldStart = 0;
 unsigned long tempUpHoldStart = 0;
 unsigned long tempDnHoldStart = 0;
+
+unsigned long tempBothHoldStart = 0;
+bool tempBothHoldArmed  = false;   // tracking while both are held
+bool tempBothHoldFired  = false;   // prevent repeat firing until released
+const unsigned long tempBothResetHoldMs = 2000;  // 2 seconds
 
 // WS2812 LED Configuration
 const uint16_t numPixels = 1;  // Number of WS2812 LEDs
@@ -55,8 +74,8 @@ Adafruit_NeoPixel ws2812 = Adafruit_NeoPixel(numPixels, ws2812Pin, NEO_GRB + NEO
 const float gammaValue = 2.2;
 const int step = 2;
 
-uint16_t brightness = 512;  // Brightness (0–1023)
-uint16_t minBrightness = 200; //10%
+uint16_t brightness = 512;  // Brightness (0–1023). Start default at 50%
+uint16_t minBrightness = 200; // 10%
 uint16_t lastBrightness = 512;   // To track previous brightness level
 
 const unsigned long brightnessUpdateInterval = 2; // Fast update interval for smooth changes
@@ -96,6 +115,9 @@ const uint32_t pwmFrequency = 20000;
 const uint8_t pwmResolution = 10;
 const uint32_t pwmMaxDuty = (1 << pwmResolution) - 1;
 
+const float    maxBrightnessPct = 0.95f;  // cap at 95% post-gamma
+const uint16_t maxBrightness    = (uint16_t)round(pwmMaxDuty * maxBrightnessPct);  // raw 10-bit limit (~972)
+
 // LEDC Channels
 const ledc_channel_t coolChannel = LEDC_CHANNEL_0;
 const ledc_channel_t warmChannel = LEDC_CHANNEL_1;
@@ -122,14 +144,14 @@ void readAmbientLight() {
   float illuminance = (Iph / 100.0) * 1000.0;
 
   // Print the results
-  DEBUG_PRINT("Raw ADC Value: ");
+  DEBUG_PRINT("[Light Sensor] Raw ADC Value: ");
   DEBUG_PRINTLN(adcValue);
-  DEBUG_PRINT("Sensor Voltage: ");
+  DEBUG_PRINT("[Light Sensor] Voltage: ");
   DEBUG_PRINTLN(voltage, 3);
-  DEBUG_PRINT("Photocurrent (µA): ");
-  DEBUG_PRINTLN(Iph, 2);
-  DEBUG_PRINT("Illuminance (lux): ");
-  DEBUG_PRINTLN(illuminance, 2);
+  Serial.print("[Light Sensor] Photocurrent (µA): ");
+  Serial.println(Iph, 2);
+  Serial.print("[Light Sensor] Illuminance (lux): ");
+  Serial.println(illuminance, 2);
 }
 
 
@@ -181,14 +203,14 @@ float readTemperature() {
   steinhart -= 273.15;                                   // Convert to °C
 
 
-  DEBUG_PRINT("ADC Value: ");
+  DEBUG_PRINT("[Thermistor] ADC Value: ");
   DEBUG_PRINTLN(adcValue);
-  DEBUG_PRINT("Voltage: ");
+  DEBUG_PRINT("[Thermistor] Voltage: ");
   DEBUG_PRINTLN(voltage, 3);
-  DEBUG_PRINT("Thermistor Resistance: ");
-  DEBUG_PRINTLN(thermistorResistance, 2);
-  DEBUG_PRINT("Calculated Temperature: ");
-  DEBUG_PRINTLN(steinhart, 2);
+  Serial.print("[Thermistor] Resistance: ");
+  Serial.println(thermistorResistance, 2);
+  Serial.print("[Thermistor] Temperature: ");
+  Serial.println(steinhart, 2);
 
   return steinhart;
 }
@@ -236,7 +258,7 @@ float applyGammaCorrection(float brightnessNormalized) {
 // Function to adjust and update brightness
 void adjustBrightness(int stepChange) {
   // Adjust brightness and clamp to valid range
-  uint16_t newBrightness = constrain(brightness + stepChange, minBrightness, 1023);
+  uint16_t newBrightness = constrain(brightness + stepChange, minBrightness, maxBrightness);
 
   // Update only if the brightness has changed
   if (newBrightness != brightness) {
@@ -259,23 +281,34 @@ void updatePWM() {
     ledc_update_duty(LEDC_LOW_SPEED_MODE, coolChannel);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, warmChannel);
 
-    //neopixel. can remove later
-    ws2812.clear();  // Clear all pixels (set to black)
-    ws2812.show();   // Update the WS2812 LED
+    if (ws2812Enabled) {
+      ws2812.clear();  // Clear all pixels (set to black)
+      ws2812.show();   // Update the WS2812 LED
+    }
+
     return;
   }
 
   //if led is turned off and brightness is 0 then turn it back on at 50%
+  //TODO: I dont think this will ever happen...
   if (ledState && brightness == 0) {
     DEBUG_PRINTLN("LED turned on at 0% brightness, resetting to 50%");
     brightness = 512;
   }
 
   // Normalize brightness (0-1), apply gamma correction, then scale back to 10-bit resolution
-  float normalizedBrightness = brightness / 1023.0f;
-  float gammaCorrected = applyGammaCorrection(normalizedBrightness);
-  uint32_t totalDuty = (uint32_t)(gammaCorrected * pwmMaxDuty);
+    // float normalizedBrightness = brightness / 1023.0f;
+  // float gammaCorrected = applyGammaCorrection(normalizedBrightness);
 
+  float normalizedBrightness = brightness / static_cast<float>(maxBrightness);
+  if (normalizedBrightness > 1.0f) {
+    normalizedBrightness = 1.0f;
+  }
+
+  float gammaCorrected = applyGammaCorrection(normalizedBrightness) * maxBrightnessPct;
+  if (gammaCorrected > maxBrightnessPct) gammaCorrected = maxBrightnessPct;
+  
+  uint32_t totalDuty = (uint32_t)(gammaCorrected * pwmMaxDuty);
   uint32_t coolDuty = (uint32_t)(totalDuty * tempRatio);
   uint32_t warmDuty = totalDuty - coolDuty;
 
@@ -294,12 +327,16 @@ void updatePWM() {
   lastColor = ws2812.Color(red, 0, blue);
   lastBrightness = wsBrightness;
 
-  // Update WS2812 LED
-  ws2812.setPixelColor(0, lastColor);
-  ws2812.show();
+  // Update WS2812 LED only if enabled
+  // Only update if enabled
+  if (ws2812Enabled) {
+    ws2812.setPixelColor(0, lastColor);
+    ws2812.show();
+  }
 }
 
 void cycleColors() {
+  if (!ws2812Enabled) return;
   // Define a simple color wheel (Red, Green, Blue)
   uint32_t colors[] = { ws2812.Color(255, 0, 0), ws2812.Color(0, 255, 0), ws2812.Color(0, 0, 255) };
 
@@ -312,7 +349,7 @@ void cycleColors() {
 }
 
 // Define buffer size for moving average
-const int bufferSize = 6;                       // Number of samples to average
+const int bufferSize = 5;                       // Number of samples to average
 float touchBuffers[5][bufferSize] = { { 0 } };  // Buffers for each touch input
 int bufferIndex = 0;                            // Circular buffer index
 
@@ -393,7 +430,7 @@ void calibrateTouchSensors() {
   // Average the values and set thresholds
   for (int i = 0; i < 5; i++) {
     baselineValues[i] /= calibrationSamples;
-    touchThresholds[i] = baselineValues[i] * 1.1; // Set threshold 500 above baseline
+    touchThresholds[i] = baselineValues[i] * 1.1; // add 10% threshold
     Serial.print("Sensor ");
     Serial.print(i);
     Serial.print(": Baseline = ");
@@ -425,27 +462,28 @@ void processTouchInputs() {
   filteredTouchTempUp = filteredValues[3];
   filteredTouchTempDown = filteredValues[4];
 
-  // Add immediate detection for significant changes
-  // DEBUG_PRINT("raw ");
-  // DEBUG_PRINTLN(rawTouchInputs[0]);
-  // DEBUG_PRINT("filtered ");
-  // DEBUG_PRINTLN(filteredLedSwitch);
+  
+  
+  // DEBUG_PRINT(rawTouchInputs[1]);
+  // DEBUG_PRINTLN(" raw");
+  // DEBUG_PRINT(filteredTouchUp);
+  // DEBUG_PRINTLN(" filtered");
   // DEBUG_PRINT("threshold ");
-  // DEBUG_PRINTLN(touchThresholds[0]);
+  // DEBUG_PRINTLN(touchThresholds[1]);
 
-  if (rawTouchInputs[0] > (touchThresholds[0]*1.2)) ledSwitchState = true;
+  if (rawTouchInputs[0] > (touchThresholds[0]*1.0)) ledSwitchState = true;
   else ledSwitchState = (filteredLedSwitch > touchThresholds[0]);
 
-  if (rawTouchInputs[1] > (touchThresholds[1]*1.2)) switchUpState = true;
+  if (rawTouchInputs[1] > (touchThresholds[1]*1.0)) switchUpState = true;
   else switchUpState = (filteredTouchUp > touchThresholds[1]);
 
-  if (rawTouchInputs[2] > (touchThresholds[2]*1.2)) switchDnState = true;
+  if (rawTouchInputs[2] > (touchThresholds[2]*1.0)) switchDnState = true;
   else switchDnState = (filteredTouchDown > touchThresholds[2]);
 
-  if (rawTouchInputs[3] > (touchThresholds[3]*1.2)) tempUpState = true;
+  if (rawTouchInputs[3] > (touchThresholds[3]*1.0)) tempUpState = true;
   else tempUpState = (filteredTouchTempUp > touchThresholds[3]);
 
-  if (rawTouchInputs[4] > (touchThresholds[4]*1.2)) tempDnState = true;
+  if (rawTouchInputs[4] > (touchThresholds[4]*1.0)) tempDnState = true;
   else tempDnState = (filteredTouchTempDown > touchThresholds[4]);
 
 
@@ -454,9 +492,13 @@ void processTouchInputs() {
 
 
 void setup() {
+  setupPWM();
   Serial.begin(115200);
   delay(100);  // Allow time for things to settle
-  DEBUG_PRINTLN("Starting Program...");
+  Serial.println("");
+  Serial.println("-------------------------------");
+  Serial.println("Starting Program OTL2 [Oct 6 2025]");
+  Serial.println("-------------------------------");
 
   startTime = millis();  // capture the time at boot
   
@@ -475,40 +517,88 @@ void setup() {
 }
 
 void loop() {
-
-
-
   // Process touch inputs
   processTouchInputs();
 
-  // Handle on/off
-  if (ledSwitchState && !lastLedSwitchState) {
-    ledState = !ledState;
-    updatePWM();
-    DEBUG_PRINT("LED turned: ");
-    DEBUG_PRINTLN(ledState ? "ON" : "OFF");
-    delay(10);
-  }
-  lastLedSwitchState = ledSwitchState;
-
-
   // Get the current time for tap detection
   unsigned long currentTime = millis();
+
+  // Handle on/off + long-hold to toggle WS2812
+if (ledSwitchState && !lastLedSwitchState) {
+  // Rising edge (finger touched)
+  bool wasOff = !ledState;
+
+  ledState = !ledState;
+  updatePWM();
+  DEBUG_PRINT("LED turned: ");
+  DEBUG_PRINTLN(ledState ? "ON" : "OFF");
+
+  // Arm the 5s hold ONLY if we just went OFF -> ON
+  if (wasOff && ledState) {
+    ledHoldArmed = true;
+    wsHoldFired  = false;
+    ledHoldStart = millis();
+  } else {
+    // If we went ON -> OFF, do not arm
+    ledHoldArmed = false;
+    wsHoldFired  = false;
+  }
+
+  delay(10);
+}
+lastLedSwitchState = ledSwitchState;
+
+// If armed, and finger is still down, check for 5s hold to toggle WS2812
+if (ledHoldArmed && ledSwitchState && !wsHoldFired) {
+  if (millis() - ledHoldStart >= ws2812ToggleHoldMs) {
+    ws2812Enabled = !ws2812Enabled;
+    
+    if (ws2812Enabled) {
+      // Turn the pixel on immediately to match current brightness/temp
+      updatePWM();  // immediate WS2812 show because ws2812Enabled is now true
+    } else {
+      // Turn the pixel off immediately
+      ws2812.clear();
+      ws2812.show();
+    }
+
+    DEBUG_PRINT("Addressable LED ");
+    DEBUG_PRINTLN(ws2812Enabled ? "ENABLED (3s hold on power-on)" : "DISABLED (3s hold on power-on)");
+    wsHoldFired = true;  // prevent repeat until release
+  }
+}
+
+// Disarm on release
+if (!ledSwitchState) {
+  ledHoldArmed = false;
+}
+
+  // if (ledSwitchState && !lastLedSwitchState) {
+  //   ledState = !ledState;
+  //   updatePWM();
+  //   DEBUG_PRINT("LED turned: ");
+  //   DEBUG_PRINTLN(ledState ? "ON" : "OFF");
+  //   delay(10);
+  // }
+  // lastLedSwitchState = ledSwitchState;
+
 
   // ------------------ Brightness Increase (Switch Up) ------------------
   if (switchUpState) {
     ledState = true;                                          // turn on LED if off
     if (!lastSwitchUpState) {                                 // Button just pressed
       if (currentTime - lastTapTimeUp < doubleTapInterval) {  // Double-tap detected
-        brightness = 1023;                                     // Max brightness
-        DEBUG_PRINTLN("Brightness set to MAX (100%)");
+        brightness = maxBrightness;  
+        DEBUG_PRINT("Brightness set to MAX (");
+        DEBUG_PRINT(maxBrightnessPct * 100.0f, 1);  // 1 decimal place (e.g., 95.0)
+        DEBUG_PRINTLN("%)");
         updatePWM();
       } else {
         switchUpHoldStart = currentTime;  // Start hold timer
       }
       lastTapTimeUp = currentTime;
     } else if (currentTime - switchUpHoldStart > dimholdDelay) {  // Press-and-hold detected
-      brightness = min(brightness + step, 1023);                   // Increment brightness
+      brightness = min<uint16_t>(brightness + step, maxBrightness);                 // Increment brightness
       DEBUG_PRINT("Brightness increased to: ");
       DEBUG_PRINTLN(brightness);
       updatePWM();
@@ -539,8 +629,28 @@ void loop() {
   }
   lastSwitchDnState = switchDnState;
 
+  // --- Hold BOTH temp buttons 2s => reset to equal ratio (50/50) ---
+  bool bothTempPressed = tempUpState && tempDnState && ledState;
+  if (bothTempPressed) {
+    if (!tempBothHoldArmed) {
+      tempBothHoldArmed = true;
+      tempBothHoldStart = currentTime;
+      tempBothHoldFired = false;
+    } else if (!tempBothHoldFired && (currentTime - tempBothHoldStart >= tempBothResetHoldMs)) {
+      tempRatio = 0.5f;           // equal warm/cool
+      updatePWM();
+      DEBUG_PRINTLN("White balance reset to 50/50 (held warm+cool for 2s).");
+      tempBothHoldFired = true;   // only fire once per hold
+    }
+  } else {
+    // released: re-arm for next time
+    tempBothHoldArmed = false;
+    tempBothHoldFired = false;
+  }
+
+
   // ------------------ Temperature Increase (Temp Up) ------------------
-  if (tempUpState && ledState) {                                  // Only adjust temperature if LED is on
+  if (!bothTempPressed && tempUpState && ledState) {              // Only adjust temperature if LED is on
     if (!lastTempUpState) {                                       // Button just pressed
       if (currentTime - lastTapTimeTempUp < doubleTapInterval) {  // Double-tap detected
         tempRatio = 1.0;                                          // Max cool
@@ -563,7 +673,7 @@ void loop() {
   lastTempUpState = tempUpState;
 
   // ------------------ Temperature Decrease (Temp Down) ------------------
-  if (tempDnState && ledState) {                                    // Only adjust temperature if LED is on
+  if (!bothTempPressed && tempDnState && ledState) {                // Only adjust temperature if LED is on
     if (!lastTempDnState) {                                         // Button just pressed
       if (currentTime - lastTapTimeTempDown < doubleTapInterval) {  // Double-tap detected
         tempRatio = 0.0;                                            // Max warm
@@ -586,11 +696,6 @@ void loop() {
   lastTempDnState = tempDnState;
 
 
-  
-
-
-
-
   // Get the current time for temperature reading
   unsigned long currentMillis = millis();
 
@@ -601,5 +706,5 @@ void loop() {
     readAmbientLight();
   }
 
-  delay(10);  // Short debounce delay
+  delay(5);  // Short debounce delay
 }
