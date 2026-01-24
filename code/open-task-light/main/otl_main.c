@@ -946,17 +946,17 @@ static inline float lerpf(float a, float b, float t)
 static inline float base_repeat_ms_for_hold(uint32_t held_ms)
 {
     // Smooth acceleration to avoid a noticeable "speed jump" while holding.
-    // Roughly matches the old 25ms -> 15ms -> 5ms steps, but transitions
+    // Slightly slower than the old 25ms -> 15ms -> 5ms steps, but transitions
     // gradually instead of abruptly.
-    float ms = 25.0f;
+    float ms = 30.0f;
 
-    // 25ms -> 15ms over ~200ms (starting near 400ms held time).
+    // 30ms -> 20ms over ~200ms (starting near 400ms held time).
     float t1 = smoothstep01(((float)held_ms - 400.0f) / 200.0f);
-    ms = lerpf(25.0f, 15.0f, t1);
+    ms = lerpf(30.0f, 20.0f, t1);
 
-    // 15ms -> 5ms over ~200ms (starting near 1200ms held time).
+    // 20ms -> 15ms over ~200ms (starting near 1200ms held time).
     float t2 = smoothstep01(((float)held_ms - 1200.0f) / 200.0f);
-    ms = lerpf(ms, 5.0f, t2);
+    ms = lerpf(ms, 15.0f, t2);
 
     return ms;
 }

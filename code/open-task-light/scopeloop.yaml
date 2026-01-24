@@ -1,0 +1,74 @@
+# ScopeLoop configuration for Open Task Light (ESP-IDF / ESP32-S3)
+#
+# Notes:
+# - PWM outputs (from code/open-task-light/main/otl_main.c):
+#   - COOL: GPIO36 (LEDC ch0)
+#   - WARM: GPIO35 (LEDC ch1)
+#   - PWM frequency: 19531 Hz (12-bit)
+# - Update the oscilloscope IP address before use.
+
+project:
+  name: "open-task-light"
+  description: "ESP32-S3 dual-channel PWM dimming validation"
+
+hardware:
+  mcu: esp32s3
+  board: "esp32-s3 module"
+  locked: false
+
+build:
+  system: esp-idf
+  project_path: .
+  target: esp32s3
+
+devices:
+  dut:
+    type: usb-serial
+    match:
+      # ESP32-S3 native USB JTAG/serial (macOS shows /dev/cu.usbmodem*)
+      vid: "0x303a"
+      pid: "0x1001"
+      # Optional; remove if you swap boards.
+      serial: "24:EC:4A:31:6A:50"
+    alias: "esp32-s3"
+
+flash:
+  method: esptool
+  device: dut
+  baud: 460800
+
+serial:
+  device: dut
+  baud: 115200
+
+instruments:
+  oscilloscope:
+    type: siglent-sds1000x
+    address: "192.168.1.100" # TODO: set to your SDS1104X-E IP
+    probes:
+      CH1:
+        signal: "GPIO36 - COOL PWM (LEDC ch0)"
+        coupling: DC
+        scale: "1V/div"
+      CH2:
+        signal: "GPIO35 - WARM PWM (LEDC ch1)"
+        coupling: DC
+        scale: "1V/div"
+
+tests:
+  - name: "PWM frequency (both channels)"
+    description: "Verify PWM is ~19.531kHz when the light is ON and brightness > 0"
+    setup:
+      - "Turn the light ON (touch LED switch) and set brightness > 0"
+    criteria:
+      - source: oscilloscope.CH1
+        measurement: frequency
+        expected: 19531
+        unit: Hz
+        tolerance_percent: 1
+      - source: oscilloscope.CH2
+        measurement: frequency
+        expected: 19531
+        unit: Hz
+        tolerance_percent: 1
+
