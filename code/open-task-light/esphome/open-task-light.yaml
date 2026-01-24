@@ -1,0 +1,1392 @@
+substitutions:
+  name: open-task-light
+  friendly_name: Open Task Light
+  fallback_ap_password: "open-task-light"
+  # If mDNS doesn't work in your network, set this to the device IP (e.g. "192.168.1.50").
+  use_address: "${name}.local"
+
+  # Touch thresholds (delta above the touch benchmark).
+  # - For ESP32-S3 touch v2, touch is detected when:
+  #     (raw_value - benchmark_value) > threshold
+  # - Use `touch_debug` to log `delta/threshold` pairs while idle and while
+  #   touching to tune sensitivity.
+  #
+  # These defaults are based on one Open Task Light PCB with the timing settings
+  # in this file; you may need to tune per-device and per-environment.
+  touch_threshold_power: "5000"
+  touch_threshold_brightness_up: "5000"
+  touch_threshold_brightness_dn: "5000"
+  touch_threshold_temp_up: "5000"
+  touch_threshold_temp_dn: "5000"
+
+  # Touch auto-calibration (tuning).
+  # Calibration measures the idle (untouched) noise and sets `threshold` above it:
+  #   idle_delta = max(0, raw_value - benchmark_value)
+  #   threshold = (idle_delta max) + max(span*multiplier, min_margin)
+  #
+  # If touches don't register, lower `touch_cal_min_margin`.
+  # If you get phantom touches, raise `touch_cal_min_margin` (or multiplier).
+  touch_cal_min_margin: "1500u"
+  touch_cal_span_multiplier: "8u"
+  touch_cal_max_margin: "10000u"
+  # Calibration timing (tuning).
+  # Longer sampling captures more noise, which helps prevent phantom touches.
+  touch_cal_settle_delay: 1500ms
+  touch_cal_samples: 120
+  touch_cal_sample_delay: 2ms
+
+  # Touch debouncing (tuning).
+  # Lower these for snappier taps; raise if you see phantom touches.
+  # Matches the ESP-IDF firmware's intent: power is very responsive; the
+  # adjustment pads are slightly more conservative to reduce false triggers.
+  touch_filter_on_delay_power: 10ms
+  touch_filter_off_delay_power: 10ms
+  touch_filter_on_delay_buttons: 20ms
+  touch_filter_off_delay_buttons: 20ms
+
+  # Touch hold timing (tuning).
+  # - Smaller repeat delay = faster changes while holding a pad.
+  # - Keep this >= ~10ms to avoid excessive state spam / CPU load.
+  touch_hold_initial_delay: 100ms
+  touch_hold_repeat_delay: 20ms
+  touch_hold_brightness_step: "0.005f"     # 0.5% per repeat
+  touch_hold_ct_step_mired: "3.0f"         # mireds per repeat
+  touch_tap_brightness_step: "0.01f"       # 1% per tap
+  touch_tap_ct_step_mired: "3.0f"          # mireds per tap
+
+  # Pin map (mirrors main/otl_main.c)
+  pin_pwm_warm: GPIO35
+  pin_pwm_cool: GPIO36
+  pin_ws2812: GPIO40
+  pin_touch_power: GPIO7
+  pin_touch_brightness_up: GPIO8
+  pin_touch_brightness_dn: GPIO9
+  pin_touch_temp_up: GPIO10
+  pin_touch_temp_dn: GPIO11
+  pin_radar_tx: GPIO43
+  pin_radar_rx: GPIO44
+  pin_radar_out: GPIO15
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    # Run after components have initialized so `esp32_touch` has valid readings.
+    priority: -10
+    then:
+      - script.execute: calibrate_touch_thresholds 
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+    # ESP-IDF v5+ deprecates the legacy touch API that ESPHome currently uses.
+    # This suppresses the build warning without changing behavior.
+    sdkconfig_options:
+      CONFIG_TOUCH_SUPPRESS_DEPRECATE_WARN: "y"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Reduce command latency (ESP32 Wi-Fi modem sleep can add seconds of lag).
+  power_save_mode: none
+  # Optional: set a static IP (recommended if you set `use_address` to an IP).
+  # manual_ip:
+  #   static_ip: 192.168.1.50
+  #   gateway: 192.168.1.1
+  #   subnet: 255.255.255.0
+  #   dns1: 192.168.1.1
+  # Address used by ESPHome for API/OTA uploads. Use a static IP here if mDNS
+  # resolution fails (the default "${name}.local" requires mDNS).
+  use_address: "${use_address}"
+  ap:
+    ssid: "${friendly_name} Fallback"
+    # If you prefer to store this in Home Assistant secrets.yaml, replace with:
+    #   password: !secret wifi_fallback_password
+    password: "${fallback_ap_password}"
+
+captive_portal:
+
+api:
+
+ota:
+  - platform: esphome
+
+# Local device web UI at `http://open-task-light.local` (or the configured IP).
+web_server:
+  port: 80
+
+# Set `baud_rate: 0` to disable serial logs (mirrors CONFIG_OTL_SERIAL_OUTPUT off).
+logger:
+  baud_rate: 115200
+  # Set to DEBUG temporarily when tuning touch thresholds.
+  level: INFO
+
+# Extra touch diagnostics (toggle at runtime via the `touch_debug` switch).
+interval:
+  - interval: 250ms
+    then:
+      - if:
+          condition:
+            switch.is_on: touch_debug
+          then:
+            - lambda: |-
+                auto read_delta = [](touch_pad_t pad, uint32_t *out_delta) -> bool {
+                  uint32_t bench = 0;
+                  uint32_t value = 0;
+                  if (touch_pad_read_benchmark(pad, &bench) != ESP_OK || bench == 0) {
+                    return false;
+                  }
+                  if (touch_pad_filter_read_smooth(pad, &value) != ESP_OK || value == 0) {
+                    if (touch_pad_read_raw_data(pad, &value) != ESP_OK || value == 0) {
+                      return false;
+                    }
+                  }
+                  *out_delta = (value > bench) ? (value - bench) : 0u;
+                  return true;
+                };
+
+                uint32_t d_power = 0, d_bu = 0, d_bd = 0, d_tu = 0, d_td = 0;
+                const bool ok_power = read_delta(id(touch_power).get_touch_pad(), &d_power);
+                const bool ok_bu = read_delta(id(touch_brightness_up).get_touch_pad(), &d_bu);
+                const bool ok_bd = read_delta(id(touch_brightness_dn).get_touch_pad(), &d_bd);
+                const bool ok_tu = read_delta(id(touch_temp_up).get_touch_pad(), &d_tu);
+                const bool ok_td = read_delta(id(touch_temp_dn).get_touch_pad(), &d_td);
+
+                ESP_LOGI("touch", "delta/thr power=%u/%u bu=%u/%u bd=%u/%u tu=%u/%u td=%u/%u (ok=%d%d%d%d%d)",
+                         (unsigned) d_power, (unsigned) id(touch_power).get_threshold(),
+                         (unsigned) d_bu, (unsigned) id(touch_brightness_up).get_threshold(),
+                         (unsigned) d_bd, (unsigned) id(touch_brightness_dn).get_threshold(),
+                         (unsigned) d_tu, (unsigned) id(touch_temp_up).get_threshold(),
+                         (unsigned) d_td, (unsigned) id(touch_temp_dn).get_threshold(),
+                         ok_power ? 1 : 0, ok_bu ? 1 : 0, ok_bd ? 1 : 0, ok_tu ? 1 : 0, ok_td ? 1 : 0);
+
+globals:
+  - id: neopixel_enabled
+    type: bool
+    restore_value: yes
+    initial_value: "false"
+  - id: power_arm_neopixel
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  # Restored when turning ON via the power pad (so OFF->ON returns to the
+  # previous brightness/CCT instead of jumping to the minimum).
+  - id: saved_brightness
+    type: float
+    restore_value: yes
+    initial_value: "0.05f"
+  - id: saved_ct_mired
+    type: float
+    restore_value: yes
+    initial_value: "1000000.0f / 2700.0f"
+  - id: touch_calibrating
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: touch_cal_sum
+    type: uint64_t
+    restore_value: no
+    initial_value: "0"
+  - id: touch_cal_min
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: touch_cal_max
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: touch_cal_count
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+switch:
+  # Quick kill-switch for debugging noisy touch pads.
+  - platform: template
+    id: touch_controls
+    name: "${friendly_name} Touch Controls"
+    entity_category: config
+    # If touch seems "dead", confirm this switch is ON in Home Assistant.
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+  - platform: template
+    id: touch_debug
+    name: "${friendly_name} Touch Debug"
+    entity_category: diagnostic
+    restore_mode: RESTORE_DEFAULT_OFF
+    optimistic: true
+
+button:
+  - platform: template
+    name: "${friendly_name} Calibrate Touch"
+    entity_category: config
+    on_press:
+      - script.execute: calibrate_touch_thresholds
+
+number:
+  # Color temperature slider for the built-in ESPHome web_server page.
+  - platform: template
+    id: ui_color_temperature
+    name: "${friendly_name} Color Temperature"
+    min_value: 2700
+    max_value: 5000
+    step: 50
+    mode: slider
+    optimistic: true
+    set_action:
+      - lambda: |-
+          // Slider is in Kelvin; ESPHome light uses mireds.
+          float k = x;
+          if (k < 2700.0f) k = 2700.0f;
+          if (k > 5000.0f) k = 5000.0f;
+          const float ct_mired = 1000000.0f / k;
+          id(saved_ct_mired) = ct_mired;
+          if (id(task_light).current_values.is_on()) {
+            auto call = id(task_light).turn_on();
+            call.set_transition_length(10);
+            call.set_color_temperature(ct_mired);
+            call.perform();
+          }
+
+output:
+  # Warm/cool PWM outputs. Frequency chosen to avoid audible whine (~19.5kHz).
+  # `max_power: 0.95` caps brightness to ~95% duty to limit heat.
+  #
+  # Note: this uses standard overlapping PWM mixing (both channels can be on).
+  # The ESP-IDF project's non-overlap mode uses LEDC `hpoint`; reproducing that
+  # in ESPHome would require a custom component.
+  - platform: ledc
+    id: pwm_warm
+    pin: ${pin_pwm_warm}
+    frequency: 19531Hz
+    channel: 0
+    max_power: 0.95
+
+  - platform: ledc
+    id: pwm_cool
+    pin: ${pin_pwm_cool}
+    frequency: 19531Hz
+    channel: 1
+    max_power: 0.95
+
+light:
+  - platform: cwww
+    id: task_light
+    name: "${friendly_name}"
+    warm_white: pwm_warm
+    cold_white: pwm_cool
+    # CCT endpoints for BXRV-TR-2750G-20A0-A-23 (2700K..5000K); adjust if your LEDs differ.
+    warm_white_color_temperature: 2700 K
+    cold_white_color_temperature: 5000 K
+    constant_brightness: true
+    gamma_correct: 1.6
+    default_transition_length: 10ms
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_state:
+      - script.execute: sync_status_pixel
+      - lambda: |-
+          // Keep "restore" values in sync (so OFF->ON returns to the previous
+          // brightness/CCT).
+          if (!id(task_light).current_values.is_on()) {
+            return;
+          }
+
+          const float b = id(task_light).current_values.get_brightness();
+          id(saved_brightness) = b;
+
+          float ct_mired = id(task_light).current_values.get_color_temperature();
+          const float ct_warm_mired = 1000000.0f / 2700.0f;
+          const float ct_cool_mired = 1000000.0f / 5000.0f;
+          if (ct_mired < ct_cool_mired) ct_mired = ct_cool_mired;
+          if (ct_mired > ct_warm_mired) ct_mired = ct_warm_mired;
+          // Only publish when CT changes (brightness-only updates are frequent).
+          float delta = ct_mired - id(saved_ct_mired);
+          if (delta < 0.0f) delta = -delta;
+          if (delta > 0.05f) {
+            id(saved_ct_mired) = ct_mired;
+            // Reflect current CT on the web_server slider (in Kelvin).
+            id(ui_color_temperature).publish_state(1000000.0f / ct_mired);
+          }
+
+  # NeoPixel status indicator (OFF by default; enabled via long-hold on power).
+  - platform: esp32_rmt_led_strip
+    id: status_pixel
+    name: "${friendly_name} Status Pixel"
+    internal: true
+    pin: ${pin_ws2812}
+    num_leds: 1
+    chipset: WS2812
+    rgb_order: GRB
+    restore_mode: ALWAYS_OFF
+
+script:
+  - id: sync_status_pixel
+    mode: restart
+    then:
+      - lambda: |-
+          auto off = id(status_pixel).turn_off();
+
+          if (!id(neopixel_enabled) || !id(task_light).current_values.is_on()) {
+            off.perform();
+            return;
+          }
+
+          // Match the firmware's warm<->cool indicator:
+          // warm -> red, cool -> blue, scaled by brightness.
+          const float ct_warm_mired = 1000000.0f / 2700.0f;
+          const float ct_cool_mired = 1000000.0f / 5000.0f;
+
+          float ct_mired = id(task_light).current_values.get_color_temperature();
+          if (ct_mired < ct_cool_mired) ct_mired = ct_cool_mired;
+          if (ct_mired > ct_warm_mired) ct_mired = ct_warm_mired;
+
+          float ratio_cool = (ct_warm_mired - ct_mired) / (ct_warm_mired - ct_cool_mired); // 0 warm .. 1 cool
+          float b = id(task_light).current_values.get_brightness(); // 0..1
+
+          float r = (1.0f - ratio_cool) * b;
+          float bl = ratio_cool * b;
+
+          auto on = id(status_pixel).turn_on();
+          on.set_rgb(r, 0.0f, bl);
+          on.perform();
+
+  - id: calibrate_touch_thresholds
+    mode: restart
+    then:
+      - lambda: |-
+          id(touch_calibrating) = true;
+          ESP_LOGI("touch_cal", "Touch calibration starting (do not touch pads)...");
+      - delay: ${touch_cal_settle_delay}
+
+      # touch_power (T7)
+      - lambda: |-
+          id(touch_cal_sum) = 0;
+          id(touch_cal_count) = 0;
+          id(touch_cal_min) = 0xFFFFFFFFu;
+          id(touch_cal_max) = 0;
+      - repeat:
+          count: ${touch_cal_samples}
+          then:
+            - lambda: |-
+                const touch_pad_t pad = id(touch_power).get_touch_pad();
+                uint32_t bench = 0;
+                uint32_t value = 0;
+                if (touch_pad_read_benchmark(pad, &bench) != ESP_OK || bench == 0) {
+                  return;
+                }
+                if (touch_pad_filter_read_smooth(pad, &value) != ESP_OK || value == 0) {
+                  if (touch_pad_read_raw_data(pad, &value) != ESP_OK || value == 0) {
+                    return;
+                  }
+                }
+                const uint32_t delta = (value > bench) ? (value - bench) : 0u;
+                id(touch_cal_sum) += delta;
+                id(touch_cal_count) += 1;
+                if (delta < id(touch_cal_min)) id(touch_cal_min) = delta;
+                if (delta > id(touch_cal_max)) id(touch_cal_max) = delta;
+            - delay: ${touch_cal_sample_delay}
+      - lambda: |-
+          const uint32_t count = id(touch_cal_count);
+          const uint32_t avg = count ? (uint32_t)(id(touch_cal_sum) / count) : 0u;
+          const uint32_t minv = id(touch_cal_min);
+          const uint32_t maxv = id(touch_cal_max);
+          if (count == 0 || minv == 0xFFFFFFFFu) {
+            ESP_LOGW("touch_cal", "touch_power calibration failed (no samples), leaving threshold=%u",
+                     (unsigned) id(touch_power).get_threshold());
+          } else {
+            const uint32_t span = maxv - minv;
+            uint32_t margin = span * ${touch_cal_span_multiplier};
+            if (margin < ${touch_cal_min_margin}) margin = ${touch_cal_min_margin};
+            if (margin > ${touch_cal_max_margin}) margin = ${touch_cal_max_margin};
+            const uint32_t thr = maxv + margin;
+            const touch_pad_t pad = id(touch_power).get_touch_pad();
+            touch_pad_set_thresh(pad, thr);
+            id(touch_power).set_threshold(thr);
+            ESP_LOGI("touch_cal", "touch_power delta_avg=%u min=%u max=%u span=%u margin=%u threshold=%u",
+                     (unsigned) avg, (unsigned) minv, (unsigned) maxv, (unsigned) span, (unsigned) margin, (unsigned) thr);
+          }
+
+      # touch_brightness_up (T8)
+      - lambda: |-
+          id(touch_cal_sum) = 0;
+          id(touch_cal_count) = 0;
+          id(touch_cal_min) = 0xFFFFFFFFu;
+          id(touch_cal_max) = 0;
+      - repeat:
+          count: ${touch_cal_samples}
+          then:
+            - lambda: |-
+                const touch_pad_t pad = id(touch_brightness_up).get_touch_pad();
+                uint32_t bench = 0;
+                uint32_t value = 0;
+                if (touch_pad_read_benchmark(pad, &bench) != ESP_OK || bench == 0) {
+                  return;
+                }
+                if (touch_pad_filter_read_smooth(pad, &value) != ESP_OK || value == 0) {
+                  if (touch_pad_read_raw_data(pad, &value) != ESP_OK || value == 0) {
+                    return;
+                  }
+                }
+                const uint32_t delta = (value > bench) ? (value - bench) : 0u;
+                id(touch_cal_sum) += delta;
+                id(touch_cal_count) += 1;
+                if (delta < id(touch_cal_min)) id(touch_cal_min) = delta;
+                if (delta > id(touch_cal_max)) id(touch_cal_max) = delta;
+            - delay: ${touch_cal_sample_delay}
+      - lambda: |-
+          const uint32_t count = id(touch_cal_count);
+          const uint32_t avg = count ? (uint32_t)(id(touch_cal_sum) / count) : 0u;
+          const uint32_t minv = id(touch_cal_min);
+          const uint32_t maxv = id(touch_cal_max);
+          if (count == 0 || minv == 0xFFFFFFFFu) {
+            ESP_LOGW("touch_cal", "touch_brightness_up calibration failed (no samples), leaving threshold=%u",
+                     (unsigned) id(touch_brightness_up).get_threshold());
+          } else {
+            const uint32_t span = maxv - minv;
+            uint32_t margin = span * ${touch_cal_span_multiplier};
+            if (margin < ${touch_cal_min_margin}) margin = ${touch_cal_min_margin};
+            if (margin > ${touch_cal_max_margin}) margin = ${touch_cal_max_margin};
+            const uint32_t thr = maxv + margin;
+            const touch_pad_t pad = id(touch_brightness_up).get_touch_pad();
+            touch_pad_set_thresh(pad, thr);
+            id(touch_brightness_up).set_threshold(thr);
+            ESP_LOGI("touch_cal", "touch_brightness_up delta_avg=%u min=%u max=%u span=%u margin=%u threshold=%u",
+                     (unsigned) avg, (unsigned) minv, (unsigned) maxv, (unsigned) span, (unsigned) margin, (unsigned) thr);
+          }
+
+      # touch_brightness_dn (T9)
+      - lambda: |-
+          id(touch_cal_sum) = 0;
+          id(touch_cal_count) = 0;
+          id(touch_cal_min) = 0xFFFFFFFFu;
+          id(touch_cal_max) = 0;
+      - repeat:
+          count: ${touch_cal_samples}
+          then:
+            - lambda: |-
+                const touch_pad_t pad = id(touch_brightness_dn).get_touch_pad();
+                uint32_t bench = 0;
+                uint32_t value = 0;
+                if (touch_pad_read_benchmark(pad, &bench) != ESP_OK || bench == 0) {
+                  return;
+                }
+                if (touch_pad_filter_read_smooth(pad, &value) != ESP_OK || value == 0) {
+                  if (touch_pad_read_raw_data(pad, &value) != ESP_OK || value == 0) {
+                    return;
+                  }
+                }
+                const uint32_t delta = (value > bench) ? (value - bench) : 0u;
+                id(touch_cal_sum) += delta;
+                id(touch_cal_count) += 1;
+                if (delta < id(touch_cal_min)) id(touch_cal_min) = delta;
+                if (delta > id(touch_cal_max)) id(touch_cal_max) = delta;
+            - delay: ${touch_cal_sample_delay}
+      - lambda: |-
+          const uint32_t count = id(touch_cal_count);
+          const uint32_t avg = count ? (uint32_t)(id(touch_cal_sum) / count) : 0u;
+          const uint32_t minv = id(touch_cal_min);
+          const uint32_t maxv = id(touch_cal_max);
+          if (count == 0 || minv == 0xFFFFFFFFu) {
+            ESP_LOGW("touch_cal", "touch_brightness_dn calibration failed (no samples), leaving threshold=%u",
+                     (unsigned) id(touch_brightness_dn).get_threshold());
+          } else {
+            const uint32_t span = maxv - minv;
+            uint32_t margin = span * ${touch_cal_span_multiplier};
+            if (margin < ${touch_cal_min_margin}) margin = ${touch_cal_min_margin};
+            if (margin > ${touch_cal_max_margin}) margin = ${touch_cal_max_margin};
+            const uint32_t thr = maxv + margin;
+            const touch_pad_t pad = id(touch_brightness_dn).get_touch_pad();
+            touch_pad_set_thresh(pad, thr);
+            id(touch_brightness_dn).set_threshold(thr);
+            ESP_LOGI("touch_cal", "touch_brightness_dn delta_avg=%u min=%u max=%u span=%u margin=%u threshold=%u",
+                     (unsigned) avg, (unsigned) minv, (unsigned) maxv, (unsigned) span, (unsigned) margin, (unsigned) thr);
+          }
+
+      # touch_temp_up (T10)
+      - lambda: |-
+          id(touch_cal_sum) = 0;
+          id(touch_cal_count) = 0;
+          id(touch_cal_min) = 0xFFFFFFFFu;
+          id(touch_cal_max) = 0;
+      - repeat:
+          count: ${touch_cal_samples}
+          then:
+            - lambda: |-
+                const touch_pad_t pad = id(touch_temp_up).get_touch_pad();
+                uint32_t bench = 0;
+                uint32_t value = 0;
+                if (touch_pad_read_benchmark(pad, &bench) != ESP_OK || bench == 0) {
+                  return;
+                }
+                if (touch_pad_filter_read_smooth(pad, &value) != ESP_OK || value == 0) {
+                  if (touch_pad_read_raw_data(pad, &value) != ESP_OK || value == 0) {
+                    return;
+                  }
+                }
+                const uint32_t delta = (value > bench) ? (value - bench) : 0u;
+                id(touch_cal_sum) += delta;
+                id(touch_cal_count) += 1;
+                if (delta < id(touch_cal_min)) id(touch_cal_min) = delta;
+                if (delta > id(touch_cal_max)) id(touch_cal_max) = delta;
+            - delay: ${touch_cal_sample_delay}
+      - lambda: |-
+          const uint32_t count = id(touch_cal_count);
+          const uint32_t avg = count ? (uint32_t)(id(touch_cal_sum) / count) : 0u;
+          const uint32_t minv = id(touch_cal_min);
+          const uint32_t maxv = id(touch_cal_max);
+          if (count == 0 || minv == 0xFFFFFFFFu) {
+            ESP_LOGW("touch_cal", "touch_temp_up calibration failed (no samples), leaving threshold=%u",
+                     (unsigned) id(touch_temp_up).get_threshold());
+          } else {
+            const uint32_t span = maxv - minv;
+            uint32_t margin = span * ${touch_cal_span_multiplier};
+            if (margin < ${touch_cal_min_margin}) margin = ${touch_cal_min_margin};
+            if (margin > ${touch_cal_max_margin}) margin = ${touch_cal_max_margin};
+            const uint32_t thr = maxv + margin;
+            const touch_pad_t pad = id(touch_temp_up).get_touch_pad();
+            touch_pad_set_thresh(pad, thr);
+            id(touch_temp_up).set_threshold(thr);
+            ESP_LOGI("touch_cal", "touch_temp_up delta_avg=%u min=%u max=%u span=%u margin=%u threshold=%u",
+                     (unsigned) avg, (unsigned) minv, (unsigned) maxv, (unsigned) span, (unsigned) margin, (unsigned) thr);
+          }
+
+      # touch_temp_dn (T11)
+      - lambda: |-
+          id(touch_cal_sum) = 0;
+          id(touch_cal_count) = 0;
+          id(touch_cal_min) = 0xFFFFFFFFu;
+          id(touch_cal_max) = 0;
+      - repeat:
+          count: ${touch_cal_samples}
+          then:
+            - lambda: |-
+                const touch_pad_t pad = id(touch_temp_dn).get_touch_pad();
+                uint32_t bench = 0;
+                uint32_t value = 0;
+                if (touch_pad_read_benchmark(pad, &bench) != ESP_OK || bench == 0) {
+                  return;
+                }
+                if (touch_pad_filter_read_smooth(pad, &value) != ESP_OK || value == 0) {
+                  if (touch_pad_read_raw_data(pad, &value) != ESP_OK || value == 0) {
+                    return;
+                  }
+                }
+                const uint32_t delta = (value > bench) ? (value - bench) : 0u;
+                id(touch_cal_sum) += delta;
+                id(touch_cal_count) += 1;
+                if (delta < id(touch_cal_min)) id(touch_cal_min) = delta;
+                if (delta > id(touch_cal_max)) id(touch_cal_max) = delta;
+            - delay: ${touch_cal_sample_delay}
+      - lambda: |-
+          const uint32_t count = id(touch_cal_count);
+          const uint32_t avg = count ? (uint32_t)(id(touch_cal_sum) / count) : 0u;
+          const uint32_t minv = id(touch_cal_min);
+          const uint32_t maxv = id(touch_cal_max);
+          if (count == 0 || minv == 0xFFFFFFFFu) {
+            ESP_LOGW("touch_cal", "touch_temp_dn calibration failed (no samples), leaving threshold=%u",
+                     (unsigned) id(touch_temp_dn).get_threshold());
+          } else {
+            const uint32_t span = maxv - minv;
+            uint32_t margin = span * ${touch_cal_span_multiplier};
+            if (margin < ${touch_cal_min_margin}) margin = ${touch_cal_min_margin};
+            if (margin > ${touch_cal_max_margin}) margin = ${touch_cal_max_margin};
+            const uint32_t thr = maxv + margin;
+            const touch_pad_t pad = id(touch_temp_dn).get_touch_pad();
+            touch_pad_set_thresh(pad, thr);
+            id(touch_temp_dn).set_threshold(thr);
+            ESP_LOGI("touch_cal", "touch_temp_dn delta_avg=%u min=%u max=%u span=%u margin=%u threshold=%u",
+                     (unsigned) avg, (unsigned) minv, (unsigned) maxv, (unsigned) span, (unsigned) margin, (unsigned) thr);
+          }
+
+      - lambda: |-
+          id(touch_calibrating) = false;
+          ESP_LOGI("touch_cal", "Touch calibration finished.");
+
+  - id: brightness_up_hold
+    mode: restart
+    then:
+      - delay: ${touch_hold_initial_delay}
+      - while:
+          condition:
+            binary_sensor.is_on: touch_brightness_up
+          then:
+            - lambda: |-
+                if (!id(touch_controls).state) {
+                  return;
+                }
+                if (id(touch_calibrating)) {
+                  return;
+                }
+                if (id(touch_brightness_dn).state) {
+                  return;
+                }
+                if (!id(task_light).current_values.is_on()) {
+                  auto call = id(task_light).turn_on();
+                  call.set_brightness(0.05f); // 5%
+                  call.perform();
+                }
+
+                float b = id(task_light).current_values.get_brightness();
+                b += ${touch_hold_brightness_step}; // +0.5%
+                if (b > 0.95f) b = 0.95f;  // cap at 95%
+
+                auto call = id(task_light).turn_on();
+                call.set_transition_length(10);
+                call.set_brightness(b);
+                call.perform();
+            - delay: ${touch_hold_repeat_delay}
+
+  - id: brightness_dn_hold
+    mode: restart
+    then:
+      - delay: ${touch_hold_initial_delay}
+      - while:
+          condition:
+            binary_sensor.is_on: touch_brightness_dn
+          then:
+            - lambda: |-
+                if (!id(touch_controls).state) {
+                  return;
+                }
+                if (id(touch_calibrating)) {
+                  return;
+                }
+                if (id(touch_brightness_up).state) {
+                  return;
+                }
+                if (!id(task_light).current_values.is_on()) {
+                  auto call = id(task_light).turn_on();
+                  call.set_brightness(0.05f); // 5%
+                  call.perform();
+                }
+
+                float b = id(task_light).current_values.get_brightness();
+                b -= ${touch_hold_brightness_step}; // -0.5%
+                if (b < 0.05f) b = 0.05f;  // clamp at 5%
+
+                auto call = id(task_light).turn_on();
+                call.set_transition_length(10);
+                call.set_brightness(b);
+                call.perform();
+            - delay: ${touch_hold_repeat_delay}
+
+  - id: temp_up_hold
+    mode: restart
+    then:
+      - delay: ${touch_hold_initial_delay}
+      - while:
+          condition:
+            binary_sensor.is_on: touch_temp_up
+          then:
+            - lambda: |-
+                if (!id(touch_controls).state) {
+                  return;
+                }
+                if (id(touch_calibrating)) {
+                  return;
+                }
+                if (id(touch_temp_dn).state) {
+                  return;
+                }
+                if (!id(task_light).current_values.is_on()) {
+                  return;
+                }
+                const float ct_warm_mired = 1000000.0f / 2700.0f;
+                const float ct_cool_mired = 1000000.0f / 5000.0f;
+
+                float ct_mired = id(task_light).current_values.get_color_temperature();
+                ct_mired -= ${touch_hold_ct_step_mired}; // cooler (lower mired)
+                if (ct_mired < ct_cool_mired) ct_mired = ct_cool_mired;
+
+                auto call = id(task_light).turn_on();
+                call.set_transition_length(10);
+                call.set_color_temperature(ct_mired);
+                call.perform();
+            - delay: ${touch_hold_repeat_delay}
+
+  - id: temp_dn_hold
+    mode: restart
+    then:
+      - delay: ${touch_hold_initial_delay}
+      - while:
+          condition:
+            binary_sensor.is_on: touch_temp_dn
+          then:
+            - lambda: |-
+                if (!id(touch_controls).state) {
+                  return;
+                }
+                if (id(touch_calibrating)) {
+                  return;
+                }
+                if (id(touch_temp_up).state) {
+                  return;
+                }
+                if (!id(task_light).current_values.is_on()) {
+                  return;
+                }
+                const float ct_warm_mired = 1000000.0f / 2700.0f;
+                const float ct_cool_mired = 1000000.0f / 5000.0f;
+
+                float ct_mired = id(task_light).current_values.get_color_temperature();
+                ct_mired += ${touch_hold_ct_step_mired}; // warmer (higher mired)
+                if (ct_mired > ct_warm_mired) ct_mired = ct_warm_mired;
+
+                auto call = id(task_light).turn_on();
+                call.set_transition_length(10);
+                call.set_color_temperature(ct_mired);
+                call.perform();
+            - delay: ${touch_hold_repeat_delay}
+
+esp32_touch:
+  # Set `setup_mode: true` temporarily to print raw baseline values for tuning.
+  setup_mode: false
+  # ESP32-S3 touch needs different timing than the original ESP32 defaults.
+  # If touch doesn't work at all, start here.
+  measurement_duration: 0.25ms
+  sleep_duration: 0.25ms
+  # Filter config (ESP32-S2/S3 only). Helps reduce noisy/phantom touches.
+  # If you set any of these, you must set all of them.
+  # If touches feel delayed, lower filter/debounce (at the cost of more noise).
+  # These match the ESP-IDF firmware defaults in `main/otl_main.c`.
+  filter_mode: IIR_16
+  debounce_count: 2
+  noise_threshold: 1
+  jitter_step: 4
+  smooth_mode: IIR_4
+  # Denoise (requires both):
+  denoise_grade: BIT8
+  denoise_cap_level: L4
+
+binary_sensor:
+  - platform: esp32_touch
+    id: touch_power
+    pin: ${pin_touch_power}
+    threshold: ${touch_threshold_power}
+    internal: true
+    filters:
+      - delayed_on: ${touch_filter_on_delay_power}
+      - delayed_off: ${touch_filter_off_delay_power}
+    on_press:
+      - lambda: |-
+          if (id(touch_debug).state) {
+            ESP_LOGI("touch", "touch_power press value=%u threshold=%u controls=%d calibrating=%d",
+                     (unsigned) id(touch_power).get_value(),
+                     (unsigned) id(touch_power).get_threshold(),
+                     id(touch_controls).state ? 1 : 0,
+                     id(touch_calibrating) ? 1 : 0);
+          }
+          if (!id(touch_controls).state) {
+            return;
+          }
+          if (id(touch_calibrating)) {
+            return;
+          }
+
+          // Cross-talk guard: only act when this pad is the "strongest" touch.
+          // This helps when a real touch causes brief threshold crossings on
+          // neighboring pads.
+          auto read_delta = [](touch_pad_t pad, uint32_t *out_delta) -> bool {
+            uint32_t bench = 0;
+            uint32_t value = 0;
+            if (touch_pad_read_benchmark(pad, &bench) != ESP_OK || bench == 0) {
+              return false;
+            }
+            if (touch_pad_filter_read_smooth(pad, &value) != ESP_OK || value == 0) {
+              if (touch_pad_read_raw_data(pad, &value) != ESP_OK || value == 0) {
+                return false;
+              }
+            }
+            *out_delta = (value > bench) ? (value - bench) : 0u;
+            return true;
+          };
+
+          uint32_t d_power = 0, d_bu = 0, d_bd = 0, d_tu = 0, d_td = 0;
+          const bool ok_power = read_delta(id(touch_power).get_touch_pad(), &d_power);
+          if (!ok_power) {
+            return;
+          }
+          (void) read_delta(id(touch_brightness_up).get_touch_pad(), &d_bu);
+          (void) read_delta(id(touch_brightness_dn).get_touch_pad(), &d_bd);
+          (void) read_delta(id(touch_temp_up).get_touch_pad(), &d_tu);
+          (void) read_delta(id(touch_temp_dn).get_touch_pad(), &d_td);
+
+          const int32_t s_power = (int32_t) d_power - (int32_t) id(touch_power).get_threshold();
+          const int32_t s_bu = (int32_t) d_bu - (int32_t) id(touch_brightness_up).get_threshold();
+          const int32_t s_bd = (int32_t) d_bd - (int32_t) id(touch_brightness_dn).get_threshold();
+          const int32_t s_tu = (int32_t) d_tu - (int32_t) id(touch_temp_up).get_threshold();
+          const int32_t s_td = (int32_t) d_td - (int32_t) id(touch_temp_dn).get_threshold();
+
+          // Pick the pad that is furthest above its own threshold.
+          int best_idx = -1;
+          int32_t best_s = 0;
+          auto consider = [&](int idx, int32_t s) {
+            if (s <= 0) return;
+            if (best_idx < 0 || s > best_s) {
+              best_idx = idx;
+              best_s = s;
+            }
+          };
+          consider(0, s_power);
+          consider(1, s_bu);
+          consider(2, s_bd);
+          consider(3, s_tu);
+          consider(4, s_td);
+
+          if (best_idx != 0) {
+            return;
+          }
+
+          // Toggle main light. NeoPixel always disables when turning OFF.
+          if (id(task_light).current_values.is_on()) {
+            // Save the current brightness/CCT before powering down.
+            const float b = id(task_light).current_values.get_brightness();
+            if (b > 0.0f) {
+              id(saved_brightness) = b;
+            }
+
+            float ct_mired = id(task_light).current_values.get_color_temperature();
+            const float ct_warm_mired = 1000000.0f / 2700.0f;
+            const float ct_cool_mired = 1000000.0f / 5000.0f;
+            if (ct_mired < ct_cool_mired) ct_mired = ct_cool_mired;
+            if (ct_mired > ct_warm_mired) ct_mired = ct_warm_mired;
+            id(saved_ct_mired) = ct_mired;
+            id(ui_color_temperature).publish_state(1000000.0f / ct_mired);
+
+            id(power_arm_neopixel) = false;
+            id(neopixel_enabled) = false;
+            auto call = id(task_light).turn_off();
+            call.set_transition_length(200);
+            call.perform();
+            return;
+          }
+
+          // Turn ON at the last brightness/CCT (with a short fade to avoid a "flash").
+          id(power_arm_neopixel) = true;
+          float b = id(saved_brightness);
+          if (b < 0.05f) b = 0.05f;
+          if (b > 1.0f) b = 1.0f;
+
+          float ct_mired = id(saved_ct_mired);
+          const float ct_warm_mired = 1000000.0f / 2700.0f;
+          const float ct_cool_mired = 1000000.0f / 5000.0f;
+          if (ct_mired < ct_cool_mired) ct_mired = ct_cool_mired;
+          if (ct_mired > ct_warm_mired) ct_mired = ct_warm_mired;
+
+          auto call = id(task_light).turn_on();
+          call.set_transition_length(200);
+          call.set_brightness(b);
+          call.set_color_temperature(ct_mired);
+          call.perform();
+    on_release:
+      - lambda: |-
+          if (id(touch_debug).state) {
+            ESP_LOGI("touch", "touch_power release value=%u threshold=%u",
+                     (unsigned) id(touch_power).get_value(),
+                     (unsigned) id(touch_power).get_threshold());
+          }
+          id(power_arm_neopixel) = false;
+    on_multi_click:
+      - timing:
+          - ON for at least 3s
+        then:
+          - lambda: |-
+              if (!id(touch_controls).state) {
+                return;
+              }
+              if (id(touch_calibrating)) {
+                return;
+              }
+              if (id(power_arm_neopixel) && id(task_light).current_values.is_on()) {
+                id(neopixel_enabled) = true;
+              }
+          - script.execute: sync_status_pixel
+
+  - platform: esp32_touch
+    id: touch_brightness_up
+    pin: ${pin_touch_brightness_up}
+    threshold: ${touch_threshold_brightness_up}
+    internal: true
+    filters:
+      - delayed_on: ${touch_filter_on_delay_buttons}
+      - delayed_off: ${touch_filter_off_delay_buttons}
+    on_press:
+      - lambda: |-
+          if (id(touch_debug).state) {
+            ESP_LOGI("touch", "touch_brightness_up press value=%u threshold=%u controls=%d calibrating=%d",
+                     (unsigned) id(touch_brightness_up).get_value(),
+                     (unsigned) id(touch_brightness_up).get_threshold(),
+                     id(touch_controls).state ? 1 : 0,
+                     id(touch_calibrating) ? 1 : 0);
+          }
+          if (!id(touch_controls).state) {
+            return;
+          }
+          if (id(touch_calibrating)) {
+            return;
+          }
+
+          // Cross-talk guard: only act when this pad is the "strongest" touch.
+          auto read_delta = [](touch_pad_t pad, uint32_t *out_delta) -> bool {
+            uint32_t bench = 0;
+            uint32_t value = 0;
+            if (touch_pad_read_benchmark(pad, &bench) != ESP_OK || bench == 0) {
+              return false;
+            }
+            if (touch_pad_filter_read_smooth(pad, &value) != ESP_OK || value == 0) {
+              if (touch_pad_read_raw_data(pad, &value) != ESP_OK || value == 0) {
+                return false;
+              }
+            }
+            *out_delta = (value > bench) ? (value - bench) : 0u;
+            return true;
+          };
+
+          uint32_t d_power = 0, d_bu = 0, d_bd = 0, d_tu = 0, d_td = 0;
+          const bool ok_bu = read_delta(id(touch_brightness_up).get_touch_pad(), &d_bu);
+          if (!ok_bu) {
+            return;
+          }
+          (void) read_delta(id(touch_power).get_touch_pad(), &d_power);
+          (void) read_delta(id(touch_brightness_dn).get_touch_pad(), &d_bd);
+          (void) read_delta(id(touch_temp_up).get_touch_pad(), &d_tu);
+          (void) read_delta(id(touch_temp_dn).get_touch_pad(), &d_td);
+
+          const int32_t s_power = (int32_t) d_power - (int32_t) id(touch_power).get_threshold();
+          const int32_t s_bu = (int32_t) d_bu - (int32_t) id(touch_brightness_up).get_threshold();
+          const int32_t s_bd = (int32_t) d_bd - (int32_t) id(touch_brightness_dn).get_threshold();
+          const int32_t s_tu = (int32_t) d_tu - (int32_t) id(touch_temp_up).get_threshold();
+          const int32_t s_td = (int32_t) d_td - (int32_t) id(touch_temp_dn).get_threshold();
+
+          int best_idx = -1;
+          int32_t best_s = 0;
+          auto consider = [&](int idx, int32_t s) {
+            if (s <= 0) return;
+            if (best_idx < 0 || s > best_s) {
+              best_idx = idx;
+              best_s = s;
+            }
+          };
+          consider(0, s_power);
+          consider(1, s_bu);
+          consider(2, s_bd);
+          consider(3, s_tu);
+          consider(4, s_td);
+
+          if (best_idx != 1) {
+            return;
+          }
+
+          id(brightness_up_hold).execute();
+
+          // Single tap: +1% (clamped to 95%).
+          if (!id(task_light).current_values.is_on()) {
+            auto on = id(task_light).turn_on();
+            on.set_brightness(0.05f);
+            on.perform();
+          }
+          float b = id(task_light).current_values.get_brightness();
+          b += ${touch_tap_brightness_step};
+          if (b > 0.95f) b = 0.95f;
+          auto call = id(task_light).turn_on();
+          call.set_transition_length(10);
+          call.set_brightness(b);
+          call.perform();
+    on_release:
+      - lambda: |-
+          if (id(touch_debug).state) {
+            ESP_LOGI("touch", "touch_brightness_up release value=%u threshold=%u",
+                     (unsigned) id(touch_brightness_up).get_value(),
+                     (unsigned) id(touch_brightness_up).get_threshold());
+          }
+    on_multi_click:
+      # Double tap -> MAX (95%).
+      - timing:
+          - ON for at most 300ms
+          - OFF for at most 300ms
+          - ON for at most 300ms
+        then:
+          - lambda: |-
+              if (!id(touch_controls).state) {
+                return;
+              }
+              if (id(touch_calibrating)) {
+                return;
+              }
+              auto call = id(task_light).turn_on();
+              call.set_brightness(0.95f);
+              call.perform();
+
+  - platform: esp32_touch
+    id: touch_brightness_dn
+    pin: ${pin_touch_brightness_dn}
+    threshold: ${touch_threshold_brightness_dn}
+    internal: true
+    filters:
+      - delayed_on: ${touch_filter_on_delay_buttons}
+      - delayed_off: ${touch_filter_off_delay_buttons}
+    on_press:
+      - lambda: |-
+          if (id(touch_debug).state) {
+            ESP_LOGI("touch", "touch_brightness_dn press value=%u threshold=%u controls=%d calibrating=%d",
+                     (unsigned) id(touch_brightness_dn).get_value(),
+                     (unsigned) id(touch_brightness_dn).get_threshold(),
+                     id(touch_controls).state ? 1 : 0,
+                     id(touch_calibrating) ? 1 : 0);
+          }
+          if (!id(touch_controls).state) {
+            return;
+          }
+          if (id(touch_calibrating)) {
+            return;
+          }
+
+          // Cross-talk guard: only act when this pad is the "strongest" touch.
+          auto read_delta = [](touch_pad_t pad, uint32_t *out_delta) -> bool {
+            uint32_t bench = 0;
+            uint32_t value = 0;
+            if (touch_pad_read_benchmark(pad, &bench) != ESP_OK || bench == 0) {
+              return false;
+            }
+            if (touch_pad_filter_read_smooth(pad, &value) != ESP_OK || value == 0) {
+              if (touch_pad_read_raw_data(pad, &value) != ESP_OK || value == 0) {
+                return false;
+              }
+            }
+            *out_delta = (value > bench) ? (value - bench) : 0u;
+            return true;
+          };
+
+          uint32_t d_power = 0, d_bu = 0, d_bd = 0, d_tu = 0, d_td = 0;
+          const bool ok_bd = read_delta(id(touch_brightness_dn).get_touch_pad(), &d_bd);
+          if (!ok_bd) {
+            return;
+          }
+          (void) read_delta(id(touch_power).get_touch_pad(), &d_power);
+          (void) read_delta(id(touch_brightness_up).get_touch_pad(), &d_bu);
+          (void) read_delta(id(touch_temp_up).get_touch_pad(), &d_tu);
+          (void) read_delta(id(touch_temp_dn).get_touch_pad(), &d_td);
+
+          const int32_t s_power = (int32_t) d_power - (int32_t) id(touch_power).get_threshold();
+          const int32_t s_bu = (int32_t) d_bu - (int32_t) id(touch_brightness_up).get_threshold();
+          const int32_t s_bd = (int32_t) d_bd - (int32_t) id(touch_brightness_dn).get_threshold();
+          const int32_t s_tu = (int32_t) d_tu - (int32_t) id(touch_temp_up).get_threshold();
+          const int32_t s_td = (int32_t) d_td - (int32_t) id(touch_temp_dn).get_threshold();
+
+          int best_idx = -1;
+          int32_t best_s = 0;
+          auto consider = [&](int idx, int32_t s) {
+            if (s <= 0) return;
+            if (best_idx < 0 || s > best_s) {
+              best_idx = idx;
+              best_s = s;
+            }
+          };
+          consider(0, s_power);
+          consider(1, s_bu);
+          consider(2, s_bd);
+          consider(3, s_tu);
+          consider(4, s_td);
+
+          if (best_idx != 2) {
+            return;
+          }
+
+          id(brightness_dn_hold).execute();
+
+          // If OFF, turn on at the normal minimum to avoid a "flash".
+          if (!id(task_light).current_values.is_on()) {
+            auto on = id(task_light).turn_on();
+            on.set_brightness(0.05f);
+            on.perform();
+          }
+
+          // Single tap: -1% (clamped to 5%).
+          float b = id(task_light).current_values.get_brightness();
+          b -= ${touch_tap_brightness_step};
+          if (b < 0.05f) b = 0.05f;
+          auto call = id(task_light).turn_on();
+          call.set_transition_length(10);
+          call.set_brightness(b);
+          call.perform();
+    on_release:
+      - lambda: |-
+          if (id(touch_debug).state) {
+            ESP_LOGI("touch", "touch_brightness_dn release value=%u threshold=%u",
+                     (unsigned) id(touch_brightness_dn).get_value(),
+                     (unsigned) id(touch_brightness_dn).get_threshold());
+          }
+    on_multi_click:
+      # Double tap -> MIN (5%).
+      - timing:
+          - ON for at most 300ms
+          - OFF for at most 300ms
+          - ON for at most 300ms
+        then:
+          - lambda: |-
+              if (!id(touch_controls).state) {
+                return;
+              }
+              if (id(touch_calibrating)) {
+                return;
+              }
+              auto call = id(task_light).turn_on();
+              call.set_brightness(0.05f);
+              call.perform();
+
+  - platform: esp32_touch
+    id: touch_temp_up
+    pin: ${pin_touch_temp_up}
+    threshold: ${touch_threshold_temp_up}
+    internal: true
+    filters:
+      - delayed_on: ${touch_filter_on_delay_buttons}
+      - delayed_off: ${touch_filter_off_delay_buttons}
+    on_press:
+      - lambda: |-
+          if (id(touch_debug).state) {
+            ESP_LOGI("touch", "touch_temp_up press value=%u threshold=%u controls=%d calibrating=%d",
+                     (unsigned) id(touch_temp_up).get_value(),
+                     (unsigned) id(touch_temp_up).get_threshold(),
+                     id(touch_controls).state ? 1 : 0,
+                     id(touch_calibrating) ? 1 : 0);
+          }
+          if (!id(touch_controls).state) {
+            return;
+          }
+          if (id(touch_calibrating)) {
+            return;
+          }
+
+          // Cross-talk guard: only act when this pad is the "strongest" touch.
+          auto read_delta = [](touch_pad_t pad, uint32_t *out_delta) -> bool {
+            uint32_t bench = 0;
+            uint32_t value = 0;
+            if (touch_pad_read_benchmark(pad, &bench) != ESP_OK || bench == 0) {
+              return false;
+            }
+            if (touch_pad_filter_read_smooth(pad, &value) != ESP_OK || value == 0) {
+              if (touch_pad_read_raw_data(pad, &value) != ESP_OK || value == 0) {
+                return false;
+              }
+            }
+            *out_delta = (value > bench) ? (value - bench) : 0u;
+            return true;
+          };
+
+          uint32_t d_power = 0, d_bu = 0, d_bd = 0, d_tu = 0, d_td = 0;
+          const bool ok_tu = read_delta(id(touch_temp_up).get_touch_pad(), &d_tu);
+          if (!ok_tu) {
+            return;
+          }
+          (void) read_delta(id(touch_power).get_touch_pad(), &d_power);
+          (void) read_delta(id(touch_brightness_up).get_touch_pad(), &d_bu);
+          (void) read_delta(id(touch_brightness_dn).get_touch_pad(), &d_bd);
+          (void) read_delta(id(touch_temp_dn).get_touch_pad(), &d_td);
+
+          const int32_t s_power = (int32_t) d_power - (int32_t) id(touch_power).get_threshold();
+          const int32_t s_bu = (int32_t) d_bu - (int32_t) id(touch_brightness_up).get_threshold();
+          const int32_t s_bd = (int32_t) d_bd - (int32_t) id(touch_brightness_dn).get_threshold();
+          const int32_t s_tu = (int32_t) d_tu - (int32_t) id(touch_temp_up).get_threshold();
+          const int32_t s_td = (int32_t) d_td - (int32_t) id(touch_temp_dn).get_threshold();
+
+          int best_idx = -1;
+          int32_t best_s = 0;
+          auto consider = [&](int idx, int32_t s) {
+            if (s <= 0) return;
+            if (best_idx < 0 || s > best_s) {
+              best_idx = idx;
+              best_s = s;
+            }
+          };
+          consider(0, s_power);
+          consider(1, s_bu);
+          consider(2, s_bd);
+          consider(3, s_tu);
+          consider(4, s_td);
+
+          if (best_idx != 3) {
+            return;
+          }
+
+          id(temp_up_hold).execute();
+
+          // Single tap: step cooler.
+          if (!id(task_light).current_values.is_on()) {
+            return;
+          }
+          const float ct_cool_mired = 1000000.0f / 5000.0f;
+          float ct_mired = id(task_light).current_values.get_color_temperature();
+          ct_mired -= ${touch_tap_ct_step_mired};
+          if (ct_mired < ct_cool_mired) ct_mired = ct_cool_mired;
+          auto call = id(task_light).turn_on();
+          call.set_transition_length(10);
+          call.set_color_temperature(ct_mired);
+          call.perform();
+    on_release:
+      - lambda: |-
+          if (id(touch_debug).state) {
+            ESP_LOGI("touch", "touch_temp_up release value=%u threshold=%u",
+                     (unsigned) id(touch_temp_up).get_value(),
+                     (unsigned) id(touch_temp_up).get_threshold());
+          }
+    on_multi_click:
+      # Double tap -> MAX COOL (5000K).
+      - timing:
+          - ON for at most 300ms
+          - OFF for at most 300ms
+          - ON for at most 300ms
+        then:
+          - lambda: |-
+              if (!id(touch_controls).state) {
+                return;
+              }
+              if (id(touch_calibrating)) {
+                return;
+              }
+              if (!id(task_light).current_values.is_on()) {
+                return;
+              }
+              auto call = id(task_light).turn_on();
+              call.set_color_temperature(1000000.0f / 5000.0f);
+              call.perform();
+
+  - platform: esp32_touch
+    id: touch_temp_dn
+    pin: ${pin_touch_temp_dn}
+    threshold: ${touch_threshold_temp_dn}
+    internal: true
+    filters:
+      - delayed_on: ${touch_filter_on_delay_buttons}
+      - delayed_off: ${touch_filter_off_delay_buttons}
+    on_press:
+      - lambda: |-
+          if (id(touch_debug).state) {
+            ESP_LOGI("touch", "touch_temp_dn press value=%u threshold=%u controls=%d calibrating=%d",
+                     (unsigned) id(touch_temp_dn).get_value(),
+                     (unsigned) id(touch_temp_dn).get_threshold(),
+                     id(touch_controls).state ? 1 : 0,
+                     id(touch_calibrating) ? 1 : 0);
+          }
+          if (!id(touch_controls).state) {
+            return;
+          }
+          if (id(touch_calibrating)) {
+            return;
+          }
+
+          // Cross-talk guard: only act when this pad is the "strongest" touch.
+          auto read_delta = [](touch_pad_t pad, uint32_t *out_delta) -> bool {
+            uint32_t bench = 0;
+            uint32_t value = 0;
+            if (touch_pad_read_benchmark(pad, &bench) != ESP_OK || bench == 0) {
+              return false;
+            }
+            if (touch_pad_filter_read_smooth(pad, &value) != ESP_OK || value == 0) {
+              if (touch_pad_read_raw_data(pad, &value) != ESP_OK || value == 0) {
+                return false;
+              }
+            }
+            *out_delta = (value > bench) ? (value - bench) : 0u;
+            return true;
+          };
+
+          uint32_t d_power = 0, d_bu = 0, d_bd = 0, d_tu = 0, d_td = 0;
+          const bool ok_td = read_delta(id(touch_temp_dn).get_touch_pad(), &d_td);
+          if (!ok_td) {
+            return;
+          }
+          (void) read_delta(id(touch_power).get_touch_pad(), &d_power);
+          (void) read_delta(id(touch_brightness_up).get_touch_pad(), &d_bu);
+          (void) read_delta(id(touch_brightness_dn).get_touch_pad(), &d_bd);
+          (void) read_delta(id(touch_temp_up).get_touch_pad(), &d_tu);
+
+          const int32_t s_power = (int32_t) d_power - (int32_t) id(touch_power).get_threshold();
+          const int32_t s_bu = (int32_t) d_bu - (int32_t) id(touch_brightness_up).get_threshold();
+          const int32_t s_bd = (int32_t) d_bd - (int32_t) id(touch_brightness_dn).get_threshold();
+          const int32_t s_tu = (int32_t) d_tu - (int32_t) id(touch_temp_up).get_threshold();
+          const int32_t s_td = (int32_t) d_td - (int32_t) id(touch_temp_dn).get_threshold();
+
+          int best_idx = -1;
+          int32_t best_s = 0;
+          auto consider = [&](int idx, int32_t s) {
+            if (s <= 0) return;
+            if (best_idx < 0 || s > best_s) {
+              best_idx = idx;
+              best_s = s;
+            }
+          };
+          consider(0, s_power);
+          consider(1, s_bu);
+          consider(2, s_bd);
+          consider(3, s_tu);
+          consider(4, s_td);
+
+          if (best_idx != 4) {
+            return;
+          }
+
+          id(temp_dn_hold).execute();
+
+          // Single tap: step warmer.
+          if (!id(task_light).current_values.is_on()) {
+            return;
+          }
+          const float ct_warm_mired = 1000000.0f / 2700.0f;
+          float ct_mired = id(task_light).current_values.get_color_temperature();
+          ct_mired += ${touch_tap_ct_step_mired};
+          if (ct_mired > ct_warm_mired) ct_mired = ct_warm_mired;
+          auto call = id(task_light).turn_on();
+          call.set_transition_length(10);
+          call.set_color_temperature(ct_mired);
+          call.perform();
+    on_release:
+      - lambda: |-
+          if (id(touch_debug).state) {
+            ESP_LOGI("touch", "touch_temp_dn release value=%u threshold=%u",
+                     (unsigned) id(touch_temp_dn).get_value(),
+                     (unsigned) id(touch_temp_dn).get_threshold());
+          }
+    on_multi_click:
+      # Double tap -> MAX WARM (2700K).
+      - timing:
+          - ON for at most 300ms
+          - OFF for at most 300ms
+          - ON for at most 300ms
+        then:
+          - lambda: |-
+              if (!id(touch_controls).state) {
+                return;
+              }
+              if (id(touch_calibrating)) {
+                return;
+              }
+              if (!id(task_light).current_values.is_on()) {
+                return;
+              }
+              auto call = id(task_light).turn_on();
+              call.set_color_temperature(1000000.0f / 2700.0f);
+              call.perform();
+
+# ---------------------------------------------------------------------------
+# LD2410B presence sensor (UART)
+  - platform: ld2410
+    ld2410_id: radar
+    has_target:
+      name: "${friendly_name} Presence"
+      id: radar_presence
+      filters:
+        - settle: 100ms
+        - delayed_off: 30s
+
+uart:
+  - id: uart_radar
+    tx_pin: ${pin_radar_tx}
+    rx_pin: ${pin_radar_rx}
+    baud_rate: 256000
+    rx_buffer_size: 1024
+
+ld2410:
+  id: radar
+  uart_id: uart_radar

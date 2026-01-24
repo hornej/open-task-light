@@ -1,0 +1,78 @@
+    uint32_t touch_detect_count[PAD_COUNT] = {0};
+
+    while (1) {
+        uint32_t now = esp_timer_get_time() / 1000; // ms
+        
+        // Read raw values for all pads
+        uint32_t raw_values[PAD_COUNT] = {0};
+        bool is_triggered[PAD_COUNT] = {0};
+        
+        for (int i = 0; i < PAD_COUNT; i++) {
+            touch_pad_read_raw_data(touch_pads[i], &raw_values[i]);
+
+            // On this board, touch makes the value rise,
+            // so treat "value above threshold" as a touch
+            is_triggered[i] = raw_values[i] > threshold[i];
+            
+            // Count consecutive detections (for stability analysis)
+            if (is_triggered[i]) {
+                touch_detect_count[i]++;
+            } else {
+                touch_detect_count[i] = 0;
+            }
+            
+            // Track value stability
+            if (abs((int32_t)raw_values[i] - (int32_t)last_raw_values[i]) < 10) {
+                value_stability_count[i]++;
+            } else {
+                value_stability_count[i] = 0;
+            }
+            
+            last_raw_values[i] = raw_values[i];
+        }
+        
+        // Log details for warm button (pad 4)
+        ESP_LOGI("touch_debug", "WARM: raw=%lu thr=%lu trig=%s",
+        (unsigned long)raw_values[4],
+        (unsigned long)threshold[4],
+        is_triggered[4] ? "YES" : "no");
+        
+        // Show all buttons status
+        ESP_LOGI("touch_debug", "All buttons: [%s][%s][%s][%s][%s]",
+                is_triggered[0] ? "ON" : "--",
+                is_triggered[1] ? "B+" : "--",
+                is_triggered[2] ? "B-" : "--",
+                is_triggered[3] ? "T+" : "--",
+                is_triggered[4] ? "T-" : "--");
+        
+        // Show raw values in a single line
+        ESP_LOGI("touch_debug", "Raw:  [%4lu][%4lu][%4lu][%4lu][%4lu]",
+                (unsigned long)raw_values[0],
+                (unsigned long)raw_values[1], 
+                (unsigned long)raw_values[2],
+                (unsigned long)raw_values[3], 
+                (unsigned long)raw_values[4]);
+                
+        // Show thresholds in a single line
+        ESP_LOGI("touch_debug", "Thrs: [%4lu][%4lu][%4lu][%4lu][%4lu]",
+                (unsigned long)threshold[0],
+                (unsigned long)threshold[1], 
+                (unsigned long)threshold[2],
+                (unsigned long)threshold[3], 
+                (unsigned long)threshold[4]);
+        
+        // Check queue status every 5 seconds
+        if (now - last_queue_check > 5000) {
+            uint32_t queue_items = uxQueueMessagesWaiting(touch_evt_queue);
+            ESP_LOGI("touch_debug", "Touch queue status: %lu items waiting", (unsigned long)queue_items);
+            last_queue_check = now;
+        }
+        
+        // Log touch filter history buffer contents
+        ESP_LOGI("touch_debug", "Filter history [newest to oldest]: 0x%08lx, 0x%08lx, 0x%08lx", 
+                (unsigned long)touch_history[history_index > 0 ? history_index - 1 : FILTER_SIZE - 1],
+                (unsigned long)touch_history[history_index > 1 ? history_index - 2 : FILTER_SIZE - (2 - history_index)],
+                (unsigned long)touch_history[history_index > 2 ? history_index - 3 : FILTER_SIZE - (3 - history_index)]);
+                
+        vTaskDelay(pdMS_TO_TICKS(500)); // Log every 500ms
+    }

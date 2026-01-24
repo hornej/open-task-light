@@ -1,0 +1,29 @@
+menu "Open Task Light"
+
+config OTL_SERIAL_OUTPUT
+    bool "Enable serial log output"
+    default y
+    help
+        Enables application log output via ESP_LOGx/printf. When disabled, the
+        application also sets the global ESP log level to NONE at runtime.
+        (Boot/ROM logs may still appear; use the ESP-IDF log output settings
+        to disable those.)
+
+config OTL_PRESENCE_SENSOR
+    bool "Enable presence sensor (LD2410B)"
+    default y
+    help
+        Enables the LD2410B presence sensor support (GPIO OUT + optional UART
+        frame parsing) and occupancy-based fade in/out behavior.
+        Disable if the sensor is not installed.
+
+config OTL_NONOVERLAP_PWM
+    bool "Non-overlapping warm/cool PWM"
+    default y
+    help
+        When enabled, warm and cool PWM outputs are time-multiplexed (phase
+        shifted) so they are never ON at the same time within a PWM cycle.
+        This can reduce peak current draw and audible/EMI artifacts.
+        Note: this currently disables LEDC hardware fade for those channels.
+
+endmenu
