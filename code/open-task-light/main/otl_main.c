@@ -32,6 +32,7 @@
 #include "driver/touch_pad.h"
 #include "esp_adc/adc_oneshot.h"
 #include "driver/gpio.h"
+#include "driver/temperature_sensor.h"
 #if CONFIG_OTL_PRESENCE_SENSOR
 #include "driver/uart.h"
 #endif
@@ -40,6 +41,7 @@
 #include "esp_adc/adc_cali_scheme.h"
 #include "freertos/queue.h"
 #include "esp_intr_alloc.h"
+#include "otl_circadian.h"
 
 // Touch event queue removed - using polling-based approach in touch_task()
 
@@ -117,6 +119,17 @@ static inline uint32_t clamp_u32(uint32_t v, uint32_t lo, uint32_t hi)
 // ---------------------------- LEDC PWM ----------------------------
 #define OTL_LEDC_DUTY_RES LEDC_TIMER_12_BIT
 #define OTL_LEDC_FREQ_HZ  19531
+#define OTL_PWM_MAX_DUTY  ((1U << OTL_LEDC_DUTY_RES) - 1U)
+
+// Minimum PWM "on" pulse width (per channel). Any non-zero duty below this
+// threshold is clamped up to avoid sub-min pulses.
+//
+// 0.3us @ 19.531kHz/12-bit => 24 duty counts.
+#define OTL_PWM_MIN_ON_TIME_NS 300ULL // 0.3us
+#define OTL_PWM_MIN_ON_DUTY_RAW \
+    ((uint32_t)(((OTL_PWM_MIN_ON_TIME_NS * (uint64_t)OTL_LEDC_FREQ_HZ * (uint64_t)OTL_PWM_MAX_DUTY) + 1000000000ULL - 1ULL) / 1000000000ULL))
+#define OTL_PWM_MIN_ON_DUTY \
+    ((OTL_PWM_MIN_ON_DUTY_RAW < 1U) ? 1U : ((OTL_PWM_MIN_ON_DUTY_RAW > OTL_PWM_MAX_DUTY) ? OTL_PWM_MAX_DUTY : OTL_PWM_MIN_ON_DUTY_RAW))
 
 static const ledc_timer_config_t ledc_timer_cfg = {
     .speed_mode       = LEDC_LOW_SPEED_MODE,
@@ -145,7 +158,8 @@ static ledc_channel_config_t ledc_ch_warm = {
     .duty       = 0,
     .hpoint     = 0
 };
-static const uint32_t PWM_MAX_DUTY = (1U << OTL_LEDC_DUTY_RES) - 1U;
+static const uint32_t PWM_MAX_DUTY = OTL_PWM_MAX_DUTY;
+static const uint32_t PWM_MIN_ON_DUTY = OTL_PWM_MIN_ON_DUTY;
 
 // ---------------------------- WS2812 (RMT LED-Strip) ----------------------------
  #define WS2812_NUM_PIXELS  1
@@ -155,7 +169,7 @@ static const uint32_t PWM_MAX_DUTY = (1U << OTL_LEDC_DUTY_RES) - 1U;
 // ---------------------------- PWM fade smoothing -------------------------------
 // Fade between duty targets in hardware so we don't "skip" duty steps.
 // Used by the hold stepper (0->max in ~1.2s at 12-bit/95% cap).
-#define PWM_HOLD_STEP_UPDATE_US       300
+#define PWM_HOLD_STEP_UPDATE_US       600
 #define PWM_FADE_STEP                 1
 // Try to keep fade duration roughly constant for small deltas so you don't get
 // "step + settle" behavior at low brightness.
@@ -163,10 +177,111 @@ static const uint32_t PWM_MAX_DUTY = (1U << OTL_LEDC_DUTY_RES) - 1U;
 #define PWM_FADE_OFF_TIME_MS          200
 #define PWM_FADE_MAX_CYCLES_PER_STEP  1000
 
+static inline uint32_t pwm_clamp_min_on_duty(uint32_t duty)
+{
+    if (duty == 0) {
+        return 0;
+    }
+    if (duty < PWM_MIN_ON_DUTY) {
+        return PWM_MIN_ON_DUTY;
+    }
+    return duty;
+}
+
 #if !CONFIG_OTL_NONOVERLAP_PWM
+typedef struct {
+    ledc_mode_t    speed_mode;
+    ledc_channel_t channel;
+} pwm_off_timer_arg_t;
+
+static esp_timer_handle_t pwm_off_timer_cool = NULL;
+static esp_timer_handle_t pwm_off_timer_warm = NULL;
+
+static pwm_off_timer_arg_t pwm_off_args_cool = {
+    .speed_mode = LEDC_LOW_SPEED_MODE,
+    .channel = LEDC_CHANNEL_0,
+};
+static pwm_off_timer_arg_t pwm_off_args_warm = {
+    .speed_mode = LEDC_LOW_SPEED_MODE,
+    .channel = LEDC_CHANNEL_1,
+};
+
+static void pwm_off_timer_cb(void *arg)
+{
+    const pwm_off_timer_arg_t *a = (const pwm_off_timer_arg_t *)arg;
+    (void)ledc_set_duty_and_update(a->speed_mode, a->channel, 0, 0);
+}
+
+static inline esp_timer_handle_t pwm_off_timer_for_channel(ledc_channel_t channel)
+{
+    if (channel == ledc_ch_cool.channel) {
+        return pwm_off_timer_cool;
+    }
+    if (channel == ledc_ch_warm.channel) {
+        return pwm_off_timer_warm;
+    }
+    return NULL;
+}
+
 static void pwm_set_duty_smooth_timed(ledc_mode_t speed_mode, ledc_channel_t channel, uint32_t target_duty, uint32_t target_time_ms)
 {
+    target_duty = MIN(target_duty, PWM_MAX_DUTY);
+    if (target_duty != 0) {
+        esp_timer_handle_t off_timer = pwm_off_timer_for_channel(channel);
+        if (off_timer != NULL) {
+            (void)esp_timer_stop(off_timer);
+        }
+        target_duty = pwm_clamp_min_on_duty(target_duty);
+    }
+
     uint32_t current_duty = ledc_get_duty(speed_mode, channel);
+    if (current_duty != 0 && current_duty < PWM_MIN_ON_DUTY) {
+        current_duty = PWM_MIN_ON_DUTY;
+        ESP_ERROR_CHECK(ledc_set_duty_and_update(speed_mode, channel, current_duty, 0));
+    }
+
+    if (target_duty == 0) {
+        // Fade down to the minimum on-time duty, then snap to fully off so we
+        // never output sub-min pulses.
+        if (current_duty == 0) {
+            return;
+        }
+        if (current_duty <= PWM_MIN_ON_DUTY) {
+            ESP_ERROR_CHECK(ledc_set_duty_and_update(speed_mode, channel, 0, 0));
+            return;
+        }
+
+        uint32_t min_duty = PWM_MIN_ON_DUTY;
+        uint32_t delta = current_duty - min_duty;
+
+        uint32_t total_cycles = (uint32_t)(((uint64_t)ledc_timer_cfg.freq_hz * target_time_ms) / 1000ULL);
+        if (total_cycles < delta) {
+            total_cycles = delta;
+        }
+
+        uint32_t cycles_per_step = total_cycles / delta;
+        cycles_per_step = clamp_u32(cycles_per_step, 1, PWM_FADE_MAX_CYCLES_PER_STEP);
+
+        ESP_ERROR_CHECK(ledc_set_fade_with_step(speed_mode, channel, min_duty, PWM_FADE_STEP, cycles_per_step));
+        ESP_ERROR_CHECK(ledc_fade_start(speed_mode, channel, LEDC_FADE_NO_WAIT));
+
+        esp_timer_handle_t off_timer = pwm_off_timer_for_channel(channel);
+        if (off_timer != NULL) {
+            (void)esp_timer_stop(off_timer);
+            ESP_ERROR_CHECK(esp_timer_start_once(off_timer, (uint64_t)target_time_ms * 1000ULL));
+        }
+        return;
+    }
+
+    // Prevent fade-up from 0 through sub-min duty values.
+    if (current_duty == 0) {
+        ESP_ERROR_CHECK(ledc_set_duty_and_update(speed_mode, channel, PWM_MIN_ON_DUTY, 0));
+        current_duty = PWM_MIN_ON_DUTY;
+        if (current_duty == target_duty) {
+            return;
+        }
+    }
+
     if (current_duty == target_duty) {
         return;
     }
@@ -197,6 +312,13 @@ static void pwm_set_warm_cool_overlap(uint32_t warm_width, uint32_t cool_width)
 {
     warm_width = MIN(warm_width, PWM_MAX_DUTY);
     cool_width = MIN(cool_width, PWM_MAX_DUTY);
+    warm_width = pwm_clamp_min_on_duty(warm_width);
+    cool_width = pwm_clamp_min_on_duty(cool_width);
+
+    if (warm_width != 0 || cool_width != 0) {
+        if (pwm_off_timer_warm != NULL) (void)esp_timer_stop(pwm_off_timer_warm);
+        if (pwm_off_timer_cool != NULL) (void)esp_timer_stop(pwm_off_timer_cool);
+    }
     ESP_ERROR_CHECK(ledc_set_duty_and_update(ledc_ch_warm.speed_mode, ledc_ch_warm.channel, warm_width, 0));
     ESP_ERROR_CHECK(ledc_set_duty_and_update(ledc_ch_cool.speed_mode, ledc_ch_cool.channel, cool_width, 0));
 }
@@ -228,13 +350,32 @@ static void pwm_set_warm_cool_nonoverlap(uint32_t warm_width, uint32_t cool_widt
     warm_width = MIN(warm_width, PWM_MAX_DUTY);
     cool_width = MIN(cool_width, PWM_MAX_DUTY);
 
+    warm_width = pwm_clamp_min_on_duty(warm_width);
+    cool_width = pwm_clamp_min_on_duty(cool_width);
+
     if ((warm_width + cool_width) > PWM_MAX_DUTY) {
         if (warm_width >= PWM_MAX_DUTY) {
             warm_width = PWM_MAX_DUTY;
             cool_width = 0;
+        } else if (cool_width >= PWM_MAX_DUTY) {
+            cool_width = PWM_MAX_DUTY;
+            warm_width = 0;
         } else {
             cool_width = PWM_MAX_DUTY - warm_width;
         }
+    }
+
+    // If the remaining budget can't accommodate a sub-min non-zero pulse, drop
+    // that channel entirely (otherwise we'd output a <min pulse width).
+    if (warm_width != 0 && warm_width < PWM_MIN_ON_DUTY) {
+        cool_width = MIN(cool_width + warm_width, PWM_MAX_DUTY);
+        warm_width = 0;
+        cool_width = pwm_clamp_min_on_duty(cool_width);
+    }
+    if (cool_width != 0 && cool_width < PWM_MIN_ON_DUTY) {
+        warm_width = MIN(warm_width + cool_width, PWM_MAX_DUTY);
+        cool_width = 0;
+        warm_width = pwm_clamp_min_on_duty(warm_width);
     }
 
     uint32_t prev_warm_width = pwm_nonoverlap_current_warm;
@@ -347,6 +488,11 @@ static bool  led_state          = false;
 static float brightness_percent = 50.0f; // 1 … 100
 static float temp_ratio         = 0.5f;  // 0.0 warm … 1.0 cool
 
+#if CONFIG_OTL_CIRCADIAN_ENABLE
+static float circadian_base_ratio = 0.5f;     // 0.0 warm .. 1.0 cool
+static float temp_ratio_user_offset = 0.0f;   // applied on top of circadian_base_ratio
+#endif
+
 static const int   BRIGHT_STEP      = 1;
 static const float TEMP_STEP        = 0.015f;
 static const int   DOUBLE_TAP_MS    = 300;
@@ -359,7 +505,7 @@ static const float MIN_BRIGHTNESS_PERCENT = 5.0f;
 // HOLD_MIN_BRIGHTNESS_PERCENT is the internal floor used for holds; the mapping
 // below converts that to a physical PWM duty floor (HOLD_MIN_PWM_DUTY_RATIO).
 static const float HOLD_MIN_BRIGHTNESS_PERCENT = 0.0f;
-static const float HOLD_MIN_PWM_DUTY_RATIO     = 0.01f; // 1% total duty floor
+static const float HOLD_MIN_PWM_DUTY_RATIO     = (float)OTL_PWM_MIN_ON_DUTY / (float)OTL_PWM_MAX_DUTY;
 // Extra offset added to brightness_percent before gamma, to avoid an overly-dim
 // low end (e.g. 1% becomes ~15% linear before gamma).
 static const int   MIN_BRIGHTNESS_OFFSET_PERCENT = 14;
@@ -372,6 +518,105 @@ static esp_timer_handle_t pwm_hold_step_timer = NULL;
 static volatile bool pwm_hold_stepper_enabled = false;
 static volatile uint32_t pwm_hold_target_total_duty = 0;
 static uint32_t pwm_hold_current_total_duty = 0;
+
+static inline float clampf(float v, float lo, float hi);
+
+#if CONFIG_OTL_CIRCADIAN_ENABLE
+static void circadian_apply_current_ratio(void)
+{
+    circadian_base_ratio = clampf(circadian_base_ratio, 0.0f, 1.0f);
+    float min_offset = -circadian_base_ratio;
+    float max_offset = 1.0f - circadian_base_ratio;
+    temp_ratio_user_offset = clampf(temp_ratio_user_offset, min_offset, max_offset);
+    temp_ratio = clampf(circadian_base_ratio + temp_ratio_user_offset, 0.0f, 1.0f);
+}
+#endif
+
+static void otl_set_temp_ratio(float ratio)
+{
+    ratio = clampf(ratio, 0.0f, 1.0f);
+#if CONFIG_OTL_CIRCADIAN_ENABLE
+    temp_ratio_user_offset = ratio - circadian_base_ratio;
+    circadian_apply_current_ratio();
+#else
+    temp_ratio = ratio;
+#endif
+}
+
+static void otl_adjust_temp_ratio(float delta)
+{
+#if CONFIG_OTL_CIRCADIAN_ENABLE
+    temp_ratio_user_offset += delta;
+    circadian_apply_current_ratio();
+#else
+    temp_ratio = clampf(temp_ratio + delta, 0.0f, 1.0f);
+#endif
+}
+
+static uint32_t brightness_percent_to_total_duty(float b_percent)
+{
+    float b = b_percent;
+    if (b < HOLD_MIN_BRIGHTNESS_PERCENT) b = HOLD_MIN_BRIGHTNESS_PERCENT;
+    if (b > (float)MAX_BRIGHTNESS_PERCENT) b = (float)MAX_BRIGHTNESS_PERCENT;
+
+    float gamma_scaled = 0.0f;
+    if (b < MIN_BRIGHTNESS_PERCENT) {
+        float linear_min = (MIN_BRIGHTNESS_PERCENT + (float)MIN_BRIGHTNESS_OFFSET_PERCENT) / 100.0f;
+        linear_min = clampf(linear_min, 0.0f, 1.0f);
+        float duty_at_min = powf(linear_min, GAMMA_CORRECTION);
+
+        float t = b / MIN_BRIGHTNESS_PERCENT; // 0..1
+        t = clampf(t, 0.0f, 1.0f);
+        gamma_scaled = HOLD_MIN_PWM_DUTY_RATIO + t * (duty_at_min - HOLD_MIN_PWM_DUTY_RATIO);
+    } else {
+        float linear = (b + (float)MIN_BRIGHTNESS_OFFSET_PERCENT) / 100.0f;
+        linear = clampf(linear, 0.0f, 1.0f);
+        gamma_scaled = powf(linear, GAMMA_CORRECTION);
+    }
+
+    float max_gamma_scaled = (float)MAX_BRIGHTNESS_PERCENT / 100.0f;
+    if (gamma_scaled > max_gamma_scaled) {
+        gamma_scaled = max_gamma_scaled;
+    }
+
+    uint32_t duty = (uint32_t)(gamma_scaled * PWM_MAX_DUTY);
+    if (duty != 0 && duty < PWM_MIN_ON_DUTY) {
+        duty = PWM_MIN_ON_DUTY;
+    }
+    return duty;
+}
+
+static float brightness_percent_from_total_duty(uint32_t total_duty)
+{
+    float lo = HOLD_MIN_BRIGHTNESS_PERCENT;
+    float hi = (float)MAX_BRIGHTNESS_PERCENT;
+
+    uint32_t duty_lo = brightness_percent_to_total_duty(lo);
+    if (total_duty <= duty_lo) {
+        return lo;
+    }
+    uint32_t duty_hi = brightness_percent_to_total_duty(hi);
+    if (total_duty >= duty_hi) {
+        return hi;
+    }
+
+    for (int i = 0; i < 24; ++i) {
+        float mid = (lo + hi) * 0.5f;
+        uint32_t mid_duty = brightness_percent_to_total_duty(mid);
+        if (mid_duty < total_duty) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+
+    uint32_t lo_duty = brightness_percent_to_total_duty(lo);
+    uint32_t hi_duty = brightness_percent_to_total_duty(hi);
+    if ((total_duty - lo_duty) <= (hi_duty - total_duty)) {
+        return lo;
+    }
+    return hi;
+}
 
 static void pwm_hold_stepper_sync_from_hw(void)
 {
@@ -451,9 +696,9 @@ static void pwm_hold_stepper_set_enabled(bool enabled)
         pwm_hold_stepper_enabled = false;
         (void)esp_timer_stop(pwm_hold_step_timer);
         if (led_state) {
-            uint32_t target = pwm_hold_target_total_duty;
-            pwm_hold_stepper_apply_total(target);
-            pwm_hold_current_total_duty = target;
+            pwm_hold_stepper_sync_from_hw();
+            pwm_hold_target_total_duty = pwm_hold_current_total_duty;
+            brightness_percent = brightness_percent_from_total_duty(pwm_hold_current_total_duty);
         }
     }
 }
@@ -467,7 +712,11 @@ static bool radar_occupied        = false;
 static bool occupancy_faded_out   = false;
 static bool saved_led_state       = false;
 static int  saved_brightness      = 0;
+#if CONFIG_OTL_CIRCADIAN_ENABLE
+static float saved_temp_ratio_offset = 0.0f;
+#else
 static float saved_temp_ratio     = 0.5f;
+#endif
 // Presence as determined from radar UART + OUT pin
 static bool radar_presence        = false;
 // Maximum distance (in cm) for presence to count when using UART data.
@@ -679,6 +928,18 @@ static void ws2812_set_rgb(uint8_t r, uint8_t g, uint8_t b)
 // Forward declaration so occupancy helpers can call it.
 static void update_outputs(void);
 
+#if CONFIG_OTL_CIRCADIAN_ENABLE
+static void otl_circadian_apply_cb(float base_ratio, void *ctx)
+{
+    (void)ctx;
+    circadian_base_ratio = base_ratio;
+    circadian_apply_current_ratio();
+    if (led_state) {
+        update_outputs();
+    }
+}
+#endif
+
 #if CONFIG_OTL_PRESENCE_SENSOR
 // ---------------------------- Occupancy helpers ----------------------------
 // Simple fade utility used when occupancy changes.
@@ -715,7 +976,11 @@ static void handle_occupancy_lost(void)
 
     saved_led_state  = led_state;
     saved_brightness = (int)lroundf(fminf(brightness_percent, (float)MAX_BRIGHTNESS_PERCENT));
+#if CONFIG_OTL_CIRCADIAN_ENABLE
+    saved_temp_ratio_offset = temp_ratio_user_offset;
+#else
     saved_temp_ratio = temp_ratio;
+#endif
 
     // Fade down to 0% brightness, then turn off.
     fade_brightness((int)lroundf(brightness_percent), 0, BRIGHT_STEP, 15);
@@ -736,7 +1001,12 @@ static void handle_occupancy_gained(void)
     }
 
     led_state  = true;
+#if CONFIG_OTL_CIRCADIAN_ENABLE
+    temp_ratio_user_offset = saved_temp_ratio_offset;
+    circadian_apply_current_ratio();
+#else
     temp_ratio = saved_temp_ratio;
+#endif
 
     // Fade from 0 up to the saved brightness.
     brightness_percent = 0;
@@ -799,6 +1069,9 @@ static void update_outputs(void)
     }
 
     uint32_t total_duty = (uint32_t)(gamma_scaled * PWM_MAX_DUTY);
+    if (total_duty != 0 && total_duty < PWM_MIN_ON_DUTY) {
+        total_duty = PWM_MIN_ON_DUTY;
+    }
     pwm_hold_target_total_duty = total_duty;
 
     if (!pwm_hold_stepper_enabled) {
@@ -828,6 +1101,49 @@ static adc_oneshot_unit_handle_t adc1_handle;
 static adc_oneshot_unit_handle_t adc2_handle;
 static const adc_channel_t als_channel = ADC_CHANNEL_4;   // GPIO5 (verify on S3)
 static const adc_channel_t ntc_channel = ADC_CHANNEL_5;   // GPIO16 (verify)
+
+#if CONFIG_OTL_SERIAL_OUTPUT
+#if SOC_TEMP_SENSOR_SUPPORTED
+static temperature_sensor_handle_t chip_temp_handle = NULL;
+
+static void chip_temp_init(void)
+{
+    // Pick a range that covers typical ESP32-S3 junction temperatures while
+    // still allowing the driver to select a valid internal calibration range.
+    temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(20, 100);
+
+    esp_err_t err = temperature_sensor_install(&cfg, &chip_temp_handle);
+    if (err != ESP_OK) {
+        OTL_LOGW("sensor", "Chip temp sensor install failed: %s", esp_err_to_name(err));
+        chip_temp_handle = NULL;
+        return;
+    }
+
+    err = temperature_sensor_enable(chip_temp_handle);
+    if (err != ESP_OK) {
+        OTL_LOGW("sensor", "Chip temp sensor enable failed: %s", esp_err_to_name(err));
+        (void)temperature_sensor_uninstall(chip_temp_handle);
+        chip_temp_handle = NULL;
+    }
+}
+
+static float read_chip_temperature(void)
+{
+    if (chip_temp_handle == NULL) {
+        return NAN;
+    }
+
+    float celsius = NAN;
+    if (temperature_sensor_get_celsius(chip_temp_handle, &celsius) != ESP_OK) {
+        return NAN;
+    }
+    return celsius;
+}
+#else
+static void chip_temp_init(void) {}
+static float read_chip_temperature(void) { return NAN; }
+#endif
+#endif
 
 static void adc_init(void)
 {
@@ -859,7 +1175,7 @@ static void adc_init(void)
     ESP_ERROR_CHECK(adc_cali_create_scheme_curve_fitting(&cali_config, &adc2_cali_handle));
 }
 
-static float read_als_lux(void)
+static float __attribute__((unused)) read_als_lux(void)
 {
     int raw = 0;
     esp_err_t err = adc_oneshot_read(adc1_handle, als_channel, &raw);
@@ -871,7 +1187,7 @@ static float read_als_lux(void)
     return (iph_uA / 100.0f) * 1000.0f; // lux
 }
 
-static float read_ntc_temperature(void)
+static float __attribute__((unused)) read_ntc_temperature(void)
 {
     const float series_resistor = 10000.0f;
     const float nominal_res    = 10000.0f;
@@ -946,17 +1262,17 @@ static inline float lerpf(float a, float b, float t)
 static inline float base_repeat_ms_for_hold(uint32_t held_ms)
 {
     // Smooth acceleration to avoid a noticeable "speed jump" while holding.
-    // Slightly slower than the old 25ms -> 15ms -> 5ms steps, but transitions
+    // Roughly matches the old 25ms -> 15ms -> 5ms steps, but transitions
     // gradually instead of abruptly.
-    float ms = 30.0f;
+    float ms = 25.0f;
 
-    // 30ms -> 20ms over ~200ms (starting near 400ms held time).
+    // 25ms -> 15ms over ~200ms (starting near 400ms held time).
     float t1 = smoothstep01(((float)held_ms - 400.0f) / 200.0f);
-    ms = lerpf(30.0f, 20.0f, t1);
+    ms = lerpf(25.0f, 15.0f, t1);
 
-    // 20ms -> 15ms over ~200ms (starting near 1200ms held time).
+    // 15ms -> 5ms over ~200ms (starting near 1200ms held time).
     float t2 = smoothstep01(((float)held_ms - 1200.0f) / 200.0f);
-    ms = lerpf(ms, 15.0f, t2);
+    ms = lerpf(ms, 5.0f, t2);
 
     return ms;
 }
@@ -1028,6 +1344,7 @@ static uint32_t tap_last_ms[PAD_COUNT] = {0};
 static uint32_t button_press_time[PAD_COUNT] = {0};
 static uint32_t last_repeat_time[PAD_COUNT] = {0};
 static bool button_being_held[PAD_COUNT] = {0};
+static bool dim_down_hold_clamp_at_min = false;
 
 
 // --- Touch event processing task ---
@@ -1135,6 +1452,11 @@ static void touch_task(void *arg)
                 button_being_held[2] = true;
                 button_press_time[2] = now;
                 last_repeat_time[2] = now;
+                // Prevent accidental entry into the deep-dim range (below the
+                // double-tap minimum) on the same press-and-hold. If we started
+                // above MIN, or we just turned on from OFF, clamp this hold at
+                // MIN until the user releases and holds again.
+                dim_down_hold_clamp_at_min = was_off || (brightness_percent > MIN_BRIGHTNESS_PERCENT);
 
                 if ((brightness_percent >= MIN_BRIGHTNESS_PERCENT) && (now - tap_last_ms[2] < DOUBLE_TAP_MS)) {
                     brightness_percent = MIN_BRIGHTNESS_PERCENT;
@@ -1163,12 +1485,12 @@ static void touch_task(void *arg)
                 last_repeat_time[3] = now;
                  
                 if (now - tap_last_ms[3] < DOUBLE_TAP_MS) {
-                    temp_ratio = 1.0f;
+                    otl_set_temp_ratio(1.0f);
                     update_outputs();
                     OTL_LOGI("touch", "Temperature set to MAX COOL (1.0)");
                 } else {
                     float prev_temp = temp_ratio;
-                    temp_ratio = fminf(temp_ratio + TEMP_STEP, 1.0f);
+                    otl_adjust_temp_ratio(TEMP_STEP);
                     if (temp_ratio != prev_temp) {
                         update_outputs();
                         OTL_LOGI("touch", "White temp increase: %.2f | Warm temp decrease: %.2f", 
@@ -1187,12 +1509,12 @@ static void touch_task(void *arg)
                 last_repeat_time[4] = now;
                  
                 if (now - tap_last_ms[4] < DOUBLE_TAP_MS) {
-                    temp_ratio = 0.0f;
+                    otl_set_temp_ratio(0.0f);
                     update_outputs();
                     OTL_LOGI("touch", "Temperature set to MAX WARM (0.0)");
                 } else {
                     float prev_temp = temp_ratio;
-                    temp_ratio = fmaxf(temp_ratio - TEMP_STEP, 0.0f);
+                    otl_adjust_temp_ratio(-TEMP_STEP);
                     if (temp_ratio != prev_temp) {
                         update_outputs();
                         OTL_LOGI("touch", "Cool temp decrease: %.2f | Warm temp increase: %.2f", 
@@ -1217,6 +1539,9 @@ static void touch_task(void *arg)
                 // Check if button is still pressed; if released, stop repeating
                 if (!pressed_now[i]) {
                     button_being_held[i] = false;
+                    if (i == 2) {
+                        dim_down_hold_clamp_at_min = false;
+                    }
                     continue;
                 }
 
@@ -1238,7 +1563,10 @@ static void touch_task(void *arg)
 
                         float effective_repeat_ms = base_repeat_ms;
                         float dist_to_limit = 0.0f;
-                        float min_brightness_limit = (i == 2) ? HOLD_MIN_BRIGHTNESS_PERCENT : MIN_BRIGHTNESS_PERCENT;
+                        float min_brightness_limit = MIN_BRIGHTNESS_PERCENT;
+                        if (i == 2) {
+                            min_brightness_limit = dim_down_hold_clamp_at_min ? MIN_BRIGHTNESS_PERCENT : HOLD_MIN_BRIGHTNESS_PERCENT;
+                        }
                         if (i == 1) {
                             dist_to_limit = (float)MAX_BRIGHTNESS_PERCENT - brightness_percent;
                         } else {
@@ -1311,11 +1639,7 @@ static void touch_task(void *arg)
                         }
 
                         float prev_temp = temp_ratio;
-                        if (i == 3) {
-                            temp_ratio = fminf(temp_ratio + delta_ratio, 1.0f);
-                        } else {
-                            temp_ratio = fmaxf(temp_ratio - delta_ratio, 0.0f);
-                        }
+                        otl_adjust_temp_ratio((i == 3) ? delta_ratio : -delta_ratio);
 
                         if (temp_ratio != prev_temp) {
                             update_outputs();
@@ -1452,15 +1776,22 @@ static void radar_task(void *arg)
 // touch_debug_task removed - was only for debugging and was disabled
 
 // ---------------------------- Sensor task (ALS + NTC) -------------------------
+#if CONFIG_OTL_SERIAL_OUTPUT
 static void sensor_task(void *arg)
 {
     while (1) {
         float lux  = read_als_lux();
-        float temp = read_ntc_temperature();
-        OTL_LOGI("sensor", "Ambient %.0f lux | Temperature %.1f °C", lux, temp);
+        float ntc_temp  = read_ntc_temperature();
+        float chip_temp = read_chip_temperature();
+        if (!isnan(chip_temp)) {
+            OTL_LOGI("sensor", "Ambient %.0f lux | NTC %.1f °C | Chip %.1f °C", lux, ntc_temp, chip_temp);
+        } else {
+            OTL_LOGI("sensor", "Ambient %.0f lux | NTC %.1f °C", lux, ntc_temp);
+        }
         vTaskDelay(pdMS_TO_TICKS(SENSOR_READ_INTERVAL_MS));
     }
 }
+#endif
 
 // ---------------------------- app_main ----------------------------------------
 // Remove all timer-related code from app_main()
@@ -1485,6 +1816,25 @@ void app_main(void)
         .skip_unhandled_events = true,
     };
     ESP_ERROR_CHECK(esp_timer_create(&pwm_hold_step_timer_args, &pwm_hold_step_timer));
+#if !CONFIG_OTL_NONOVERLAP_PWM
+    const esp_timer_create_args_t pwm_off_timer_cool_args = {
+        .callback = &pwm_off_timer_cb,
+        .arg = &pwm_off_args_cool,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "pwm_off_cool",
+        .skip_unhandled_events = true,
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&pwm_off_timer_cool_args, &pwm_off_timer_cool));
+
+    const esp_timer_create_args_t pwm_off_timer_warm_args = {
+        .callback = &pwm_off_timer_cb,
+        .arg = &pwm_off_args_warm,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "pwm_off_warm",
+        .skip_unhandled_events = true,
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&pwm_off_timer_warm_args, &pwm_off_timer_warm));
+#endif
 #if CONFIG_OTL_NONOVERLAP_PWM
     pwm_nonoverlap_mutex = xSemaphoreCreateMutex();
     if (pwm_nonoverlap_mutex == NULL) {
@@ -1596,6 +1946,18 @@ void app_main(void)
 
     // 5. ADC (ALS + NTC)
     adc_init();
+
+    // 5b. ESP32 internal temperature sensor
+#if CONFIG_OTL_SERIAL_OUTPUT
+    chip_temp_init();
+#endif
+
+#if CONFIG_OTL_CIRCADIAN_ENABLE
+    esp_err_t circadian_err = otl_circadian_start(otl_circadian_apply_cb, NULL);
+    if (circadian_err != ESP_OK) {
+        OTL_LOGE("circadian", "Start failed: %s", esp_err_to_name(circadian_err));
+    }
+#endif
 
     // 6. Start tasks with adequate stack sizes
     // touch_task and radar_task need larger stacks due to complex state

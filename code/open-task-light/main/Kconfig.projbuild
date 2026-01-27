@@ -26,4 +26,66 @@ config OTL_NONOVERLAP_PWM
         This can reduce peak current draw and audible/EMI artifacts.
         Note: this currently disables LEDC hardware fade for those channels.
 
+config OTL_CIRCADIAN_ENABLE
+    bool "Enable circadian color temperature (WiFi + SNTP)"
+    default n
+    help
+        Connects to WiFi, syncs local time via SNTP, and continuously updates
+        the warm/cool mix over a 24-hour cycle: cooler during the day and
+        warmer as evening/night approaches.
+
+menu "Circadian Lighting"
+    depends on OTL_CIRCADIAN_ENABLE
+
+config OTL_WIFI_SSID
+    string "WiFi SSID"
+    default ""
+
+config OTL_WIFI_PASSWORD
+    string "WiFi Password"
+    default ""
+
+config OTL_TIMEZONE
+    string "Timezone (POSIX TZ string)"
+    default "UTC0"
+    help
+        Newlib uses POSIX TZ strings (not IANA names like America/Los_Angeles).
+        Example (US Pacific w/ DST): PST8PDT,M3.2.0/2,M11.1.0/2
+        Example (US Eastern w/ DST): EST5EDT,M3.2.0/2,M11.1.0/2
+        Example (UTC): UTC0
+
+config OTL_SNTP_SERVER
+    string "SNTP server"
+    default "pool.ntp.org"
+
+config OTL_CIRCADIAN_UPDATE_INTERVAL_SEC
+    int "Update interval (seconds)"
+    range 5 3600
+    default 60
+    help
+        How often the firmware recalculates the target warm/cool mix based on
+        local time. Smaller values are smoother but wake the CPU more often.
+
+config OTL_CIRCADIAN_PEAK_HOUR
+    int "Coolest time (hour)"
+    range 0 23
+    default 11
+
+config OTL_CIRCADIAN_PEAK_MINUTE
+    int "Coolest time (minute)"
+    range 0 59
+    default 0
+
+config OTL_CIRCADIAN_COOL_MIN_PCT
+    int "Minimum cool ratio (%)"
+    range 0 100
+    default 0
+
+config OTL_CIRCADIAN_COOL_MAX_PCT
+    int "Maximum cool ratio (%)"
+    range 0 100
+    default 100
+
+endmenu
+
 endmenu
