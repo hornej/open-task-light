@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>     
+#include <time.h>
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -21,11 +22,66 @@
 #define OTL_LOGW(tag, fmt, ...) ESP_LOGW(tag, fmt, ##__VA_ARGS__)
 #define OTL_LOGE(tag, fmt, ...) ESP_LOGE(tag, fmt, ##__VA_ARGS__)
 #define OTL_LOGD(tag, fmt, ...) ESP_LOGD(tag, fmt, ##__VA_ARGS__)
+#define OTL_LOGI_PERIODIC(tag, fmt, ...) do { \
+    char _otl_ts[32]; \
+    ESP_LOGI(tag, "[%s] " fmt, otl_log_localtime(_otl_ts, sizeof(_otl_ts)), ##__VA_ARGS__); \
+} while (0)
 #else
 #define OTL_LOGI(tag, fmt, ...) do { (void)(tag); (void)(fmt); } while (0)
 #define OTL_LOGW(tag, fmt, ...) do { (void)(tag); (void)(fmt); } while (0)
 #define OTL_LOGE(tag, fmt, ...) do { (void)(tag); (void)(fmt); } while (0)
 #define OTL_LOGD(tag, fmt, ...) do { (void)(tag); (void)(fmt); } while (0)
+#define OTL_LOGI_PERIODIC(tag, fmt, ...) do { (void)(tag); (void)(fmt); } while (0)
+#endif
+
+#if CONFIG_OTL_SERIAL_OUTPUT && CONFIG_OTL_LOG_STATUS
+#define OTL_LOG_STATUSI(fmt, ...) OTL_LOGI_PERIODIC("sensor", fmt, ##__VA_ARGS__)
+#else
+#define OTL_LOG_STATUSI(fmt, ...) do { (void)(fmt); } while (0)
+#endif
+
+#if CONFIG_OTL_SERIAL_OUTPUT && CONFIG_OTL_LOG_TOUCH_EVENTS
+#define OTL_LOG_TOUCHI(fmt, ...) OTL_LOGI("touch", fmt, ##__VA_ARGS__)
+#else
+#define OTL_LOG_TOUCHI(fmt, ...) do { (void)(fmt); } while (0)
+#endif
+
+#if CONFIG_OTL_SERIAL_OUTPUT && CONFIG_OTL_LOG_TOUCH_CAL
+#define OTL_LOG_TOUCH_CALI(fmt, ...) OTL_LOGI_PERIODIC("touch", fmt, ##__VA_ARGS__)
+#else
+#define OTL_LOG_TOUCH_CALI(fmt, ...) do { (void)(fmt); } while (0)
+#endif
+
+#if CONFIG_OTL_SERIAL_OUTPUT && CONFIG_OTL_LOG_RADAR_STATUS
+#define OTL_LOG_RADARI(fmt, ...) OTL_LOGI_PERIODIC("radar", fmt, ##__VA_ARGS__)
+#else
+#define OTL_LOG_RADARI(fmt, ...) do { (void)(fmt); } while (0)
+#endif
+
+#if CONFIG_OTL_SERIAL_OUTPUT
+static const char *otl_log_localtime(char *buf, size_t buf_len) __attribute__((unused));
+static const char *otl_log_localtime(char *buf, size_t buf_len)
+{
+    if (buf == NULL || buf_len == 0) {
+        return "time=unset";
+    }
+
+    time_t now = 0;
+    struct tm timeinfo = {0};
+    time(&now);
+    localtime_r(&now, &timeinfo);
+
+    // Year since 1900. Anything pre-2020 is almost certainly "not synced".
+    if (timeinfo.tm_year < (2020 - 1900)) {
+        return "time=unset";
+    }
+
+    if (strftime(buf, buf_len, "%Y-%m-%d %H:%M:%S", &timeinfo) == 0) {
+        return "time=unset";
+    }
+
+    return buf;
+}
 #endif
 #include "esp_timer.h"
 #include "driver/ledc.h"
@@ -81,7 +137,8 @@ static size_t  radar_rx_len = 0;
 // --- Application-wide timing constants ---
 #define TOUCH_MEAS_WAIT_MS        250   // Max wait for touch measurement to complete
 #define TOUCH_SETTLE_MS           100   // Delay for filter/FSM to settle before calibration
-#define SENSOR_READ_INTERVAL_MS   10000 // Interval between ALS/NTC sensor readings
+#define SENSOR_READ_INTERVAL_MS   10000 // Interval between sensor log lines
+#define THERMAL_POLL_INTERVAL_MS  1000  // Interval between thermal checks
 #define RECALIB_INTERVAL_MS       60000 // Interval between touch recalibration attempts
 #define RADAR_MAX_ENERGY          100   // Maximum energy value from LD2410 radar
 
@@ -174,7 +231,10 @@ static const uint32_t PWM_MIN_ON_DUTY = OTL_PWM_MIN_ON_DUTY;
 // Try to keep fade duration roughly constant for small deltas so you don't get
 // "step + settle" behavior at low brightness.
 #define PWM_FADE_TARGET_TIME_MS       10
-#define PWM_FADE_OFF_TIME_MS          200
+// Faster turn-off fade: use a larger duty step so we aren't limited to
+// "1 duty count per PWM period" at high brightness.
+#define PWM_FADE_OFF_STEP             2
+#define PWM_FADE_OFF_TIME_MS          100
 #define PWM_FADE_MAX_CYCLES_PER_STEP  1000
 
 static inline uint32_t pwm_clamp_min_on_duty(uint32_t duty)
@@ -254,21 +314,36 @@ static void pwm_set_duty_smooth_timed(ledc_mode_t speed_mode, ledc_channel_t cha
         uint32_t min_duty = PWM_MIN_ON_DUTY;
         uint32_t delta = current_duty - min_duty;
 
-        uint32_t total_cycles = (uint32_t)(((uint64_t)ledc_timer_cfg.freq_hz * target_time_ms) / 1000ULL);
-        if (total_cycles < delta) {
-            total_cycles = delta;
+        uint32_t fade_step = PWM_FADE_OFF_STEP;
+        if (fade_step == 0) {
+            fade_step = 1;
+        }
+        uint32_t steps_required = (delta + fade_step - 1U) / fade_step;
+        if (steps_required < 1U) {
+            steps_required = 1U;
         }
 
-        uint32_t cycles_per_step = total_cycles / delta;
+        uint32_t total_cycles = (uint32_t)(((uint64_t)ledc_timer_cfg.freq_hz * target_time_ms) / 1000ULL);
+        if (total_cycles < steps_required) {
+            total_cycles = steps_required;
+        }
+
+        uint32_t cycles_per_step = total_cycles / steps_required;
         cycles_per_step = clamp_u32(cycles_per_step, 1, PWM_FADE_MAX_CYCLES_PER_STEP);
 
-        ESP_ERROR_CHECK(ledc_set_fade_with_step(speed_mode, channel, min_duty, PWM_FADE_STEP, cycles_per_step));
+        ESP_ERROR_CHECK(ledc_set_fade_with_step(speed_mode, channel, min_duty, fade_step, cycles_per_step));
         ESP_ERROR_CHECK(ledc_fade_start(speed_mode, channel, LEDC_FADE_NO_WAIT));
+
+        uint64_t actual_cycles = (uint64_t)steps_required * (uint64_t)cycles_per_step;
+        uint64_t actual_time_us = (actual_cycles * 1000000ULL) / (uint64_t)ledc_timer_cfg.freq_hz;
+        if (actual_time_us < 1ULL) {
+            actual_time_us = 1ULL;
+        }
 
         esp_timer_handle_t off_timer = pwm_off_timer_for_channel(channel);
         if (off_timer != NULL) {
             (void)esp_timer_stop(off_timer);
-            ESP_ERROR_CHECK(esp_timer_start_once(off_timer, (uint64_t)target_time_ms * 1000ULL));
+            ESP_ERROR_CHECK(esp_timer_start_once(off_timer, actual_time_us));
         }
         return;
     }
@@ -428,8 +503,19 @@ static void pwm_nonoverlap_set_target(uint32_t warm_target, uint32_t cool_target
     }
 
     uint64_t total_cycles = ((uint64_t)ledc_timer_cfg.freq_hz * (uint64_t)target_time_ms) / 1000ULL;
-    if (total_cycles < (uint64_t)delta_max) {
-        total_cycles = (uint64_t)delta_max;
+    uint32_t fade_step = PWM_FADE_STEP;
+    if (warm_target == 0 && cool_target == 0) {
+        fade_step = PWM_FADE_OFF_STEP;
+    }
+    if (fade_step == 0) {
+        fade_step = 1;
+    }
+    uint32_t steps_required = (delta_max + fade_step - 1U) / fade_step;
+    if (steps_required < 1U) {
+        steps_required = 1U;
+    }
+    if (total_cycles < (uint64_t)steps_required) {
+        total_cycles = (uint64_t)steps_required;
     }
     int64_t duration_us = (int64_t)((total_cycles * 1000000ULL) / (uint64_t)ledc_timer_cfg.freq_hz);
     if (duration_us < 1) {
@@ -501,6 +587,19 @@ static const float GAMMA_CORRECTION = 1.6f;
 // Limit maximum brightness to avoid overheating
 static const int   MAX_BRIGHTNESS_PERCENT = 95;
 static const float MIN_BRIGHTNESS_PERCENT = 5.0f;
+
+// ---------------------------- Thermal protection ------------------------------
+// If either sensor crosses the "hot" threshold, clamp the *effective* maximum
+// brightness down until it cools by a small hysteresis.
+#define OTL_THERMAL_NTC_HOT_C                    95.0f
+#define OTL_THERMAL_NTC_HYST_C                   3.0f
+#define OTL_THERMAL_CHIP_HOT_C                   75.0f
+#define OTL_THERMAL_CHIP_HYST_C                  3.0f
+#define OTL_THERMAL_DIM_MAX_BRIGHTNESS_PERCENT   30.0f
+
+static volatile bool thermal_ntc_hot = false;
+static volatile bool thermal_chip_hot = false;
+static volatile float thermal_brightness_cap_percent = 100.0f;
 // While holding dim-down, allow a deeper range below the normal minimum.
 // HOLD_MIN_BRIGHTNESS_PERCENT is the internal floor used for holds; the mapping
 // below converts that to a physical PWM duty floor (HOLD_MIN_PWM_DUTY_RATIO).
@@ -518,6 +617,10 @@ static esp_timer_handle_t pwm_hold_step_timer = NULL;
 static volatile bool pwm_hold_stepper_enabled = false;
 static volatile uint32_t pwm_hold_target_total_duty = 0;
 static uint32_t pwm_hold_current_total_duty = 0;
+
+#if CONFIG_OTL_SERIAL_OUTPUT && CONFIG_OTL_LOG_PWM_DUTY
+static esp_timer_handle_t pwm_log_timer = NULL;
+#endif
 
 static inline float clampf(float v, float lo, float hi);
 
@@ -698,10 +801,70 @@ static void pwm_hold_stepper_set_enabled(bool enabled)
         if (led_state) {
             pwm_hold_stepper_sync_from_hw();
             pwm_hold_target_total_duty = pwm_hold_current_total_duty;
-            brightness_percent = brightness_percent_from_total_duty(pwm_hold_current_total_duty);
+            float b_cap = clampf((float)thermal_brightness_cap_percent, HOLD_MIN_BRIGHTNESS_PERCENT, (float)MAX_BRIGHTNESS_PERCENT);
+            if (brightness_percent <= (b_cap + 0.01f)) {
+                brightness_percent = brightness_percent_from_total_duty(pwm_hold_current_total_duty);
+            }
         }
     }
 }
+
+#if CONFIG_OTL_SERIAL_OUTPUT && CONFIG_OTL_LOG_PWM_DUTY
+static void pwm_log_timer_cb(void *arg)
+{
+    (void)arg;
+
+    uint32_t warm = 0;
+    uint32_t cool = 0;
+
+#if CONFIG_OTL_NONOVERLAP_PWM
+    warm = pwm_nonoverlap_current_warm;
+    cool = pwm_nonoverlap_current_cool;
+#else
+    warm = ledc_get_duty(ledc_ch_warm.speed_mode, ledc_ch_warm.channel);
+    cool = ledc_get_duty(ledc_ch_cool.speed_mode, ledc_ch_cool.channel);
+#endif
+
+    if (warm == 0 && cool == 0) {
+        return;
+    }
+
+    uint32_t total = warm + cool;
+    if (total > PWM_MAX_DUTY) {
+        total = PWM_MAX_DUTY;
+    }
+
+    uint32_t target_total = led_state ? pwm_hold_target_total_duty : 0;
+
+    static uint32_t last_warm = 0xFFFFFFFFu;
+    static uint32_t last_cool = 0xFFFFFFFFu;
+    static uint32_t last_target_total = 0xFFFFFFFFu;
+    static bool last_led_state = false;
+
+    if (warm == last_warm &&
+        cool == last_cool &&
+        target_total == last_target_total &&
+        led_state == last_led_state) {
+        return;
+    }
+
+    last_warm = warm;
+    last_cool = cool;
+    last_target_total = target_total;
+    last_led_state = led_state;
+
+    OTL_LOGI_PERIODIC("pwm",
+                      "state=%s B=%.1f%% temp=%.3f warm=%lu cool=%lu total=%lu target=%lu stepper=%d",
+                      led_state ? "ON" : "OFF",
+                      brightness_percent,
+                      temp_ratio,
+                      (unsigned long)warm,
+                      (unsigned long)cool,
+                      (unsigned long)total,
+                      (unsigned long)target_total,
+                      pwm_hold_stepper_enabled ? 1 : 0);
+}
+#endif
 
 #if CONFIG_OTL_PRESENCE_SENSOR
 // ---------------------------- Occupancy (LD2410B) ----------------------------
@@ -755,7 +918,7 @@ static const float touch_threshold_margin_pct[PAD_COUNT] = { 0.05f, 0.03f, 0.03f
 
 static void calibrate_touch_pads(void)
 {
-    OTL_LOGI("touch", "Calibrating touch pads (dynamic baseline/threshold)...");
+    OTL_LOG_TOUCH_CALI("Calibrating touch pads (dynamic baseline/threshold)...");
 
     // Strategy adapted from the Arduino sketch:
     //  - sample each pad several times with no touch
@@ -801,7 +964,7 @@ static void calibrate_touch_pads(void)
 
         ESP_ERROR_CHECK(touch_pad_set_thresh(touch_pads[i], threshold[i]));
 
-        OTL_LOGI("touch", "Pad %d baseline=%lu threshold=%lu noise_span=%lu margin=%lu",
+        OTL_LOG_TOUCH_CALI("Pad %d baseline=%lu threshold=%lu noise_span=%lu margin=%lu",
                  i,
                  (unsigned long)baseline[i],
                  (unsigned long)threshold[i],
@@ -828,7 +991,7 @@ static void recalibration_task(void *arg)
         }
         
         if (can_recalibrate) {
-            OTL_LOGI("touch", "Performing periodic recalibration");
+            OTL_LOG_TOUCH_CALI("Performing periodic recalibration");
             calibrate_touch_pads();
         }
     }
@@ -927,6 +1090,57 @@ static void ws2812_set_rgb(uint8_t r, uint8_t g, uint8_t b)
 
 // Forward declaration so occupancy helpers can call it.
 static void update_outputs(void);
+
+static void thermal_update(float ntc_c, float chip_c)
+{
+    bool prev_ntc_hot = thermal_ntc_hot;
+    bool prev_chip_hot = thermal_chip_hot;
+
+    if (!isnan(ntc_c)) {
+        if (!thermal_ntc_hot) {
+            if (ntc_c >= OTL_THERMAL_NTC_HOT_C) {
+                thermal_ntc_hot = true;
+            }
+        } else {
+            if (ntc_c <= (OTL_THERMAL_NTC_HOT_C - OTL_THERMAL_NTC_HYST_C)) {
+                thermal_ntc_hot = false;
+            }
+        }
+    }
+
+    if (!isnan(chip_c)) {
+        if (!thermal_chip_hot) {
+            if (chip_c >= OTL_THERMAL_CHIP_HOT_C) {
+                thermal_chip_hot = true;
+            }
+        } else {
+            if (chip_c <= (OTL_THERMAL_CHIP_HOT_C - OTL_THERMAL_CHIP_HYST_C)) {
+                thermal_chip_hot = false;
+            }
+        }
+    }
+
+    bool throttled = thermal_ntc_hot || thermal_chip_hot;
+    float new_cap = throttled ? OTL_THERMAL_DIM_MAX_BRIGHTNESS_PERCENT : (float)MAX_BRIGHTNESS_PERCENT;
+
+    if (fabsf(new_cap - (float)thermal_brightness_cap_percent) > 0.01f) {
+        thermal_brightness_cap_percent = new_cap;
+        if (led_state) {
+            update_outputs();
+        }
+    }
+
+    if ((prev_ntc_hot != thermal_ntc_hot) || (prev_chip_hot != thermal_chip_hot)) {
+        OTL_LOGW("thermal",
+                 "Thermal %s (NTC=%s%.1fC, Chip=%s%.1fC) -> max=%.0f%%",
+                 throttled ? "LIMIT" : "OK",
+                 thermal_ntc_hot ? "HOT " : "",
+                 ntc_c,
+                 thermal_chip_hot ? "HOT " : "",
+                 chip_c,
+                 new_cap);
+    }
+}
 
 #if CONFIG_OTL_CIRCADIAN_ENABLE
 static void otl_circadian_apply_cb(float base_ratio, void *ctx)
@@ -1040,7 +1254,8 @@ static void update_outputs(void)
     // to MAX_BRIGHTNESS_PERCENT to avoid overheating.
     float b = brightness_percent;
     if (b < HOLD_MIN_BRIGHTNESS_PERCENT) b = HOLD_MIN_BRIGHTNESS_PERCENT;
-    if (b > (float)MAX_BRIGHTNESS_PERCENT) b = (float)MAX_BRIGHTNESS_PERCENT;
+    float b_cap = clampf((float)thermal_brightness_cap_percent, HOLD_MIN_BRIGHTNESS_PERCENT, (float)MAX_BRIGHTNESS_PERCENT);
+    if (b > b_cap) b = b_cap;
 
     float gamma_scaled = 0.0f;
     if (b < MIN_BRIGHTNESS_PERCENT) {
@@ -1102,7 +1317,6 @@ static adc_oneshot_unit_handle_t adc2_handle;
 static const adc_channel_t als_channel = ADC_CHANNEL_4;   // GPIO5 (verify on S3)
 static const adc_channel_t ntc_channel = ADC_CHANNEL_5;   // GPIO16 (verify)
 
-#if CONFIG_OTL_SERIAL_OUTPUT
 #if SOC_TEMP_SENSOR_SUPPORTED
 static temperature_sensor_handle_t chip_temp_handle = NULL;
 
@@ -1143,7 +1357,6 @@ static float read_chip_temperature(void)
 static void chip_temp_init(void) {}
 static float read_chip_temperature(void) { return NAN; }
 #endif
-#endif
 
 static void adc_init(void)
 {
@@ -1180,11 +1393,18 @@ static float __attribute__((unused)) read_als_lux(void)
     int raw = 0;
     esp_err_t err = adc_oneshot_read(adc1_handle, als_channel, &raw);
     if (err != ESP_OK) {
+#if CONFIG_OTL_SENSOR_DEBUG
+        OTL_LOGW("sensor", "ALS read failed: %s", esp_err_to_name(err));
+#endif
         return 0.0f;  // Return safe default on error
     }
     float voltage = (raw / 4095.0f) * 3.3f;
     float iph_uA  = (voltage / 10000.0f) * 1e6f;
-    return (iph_uA / 100.0f) * 1000.0f; // lux
+    float lux = (iph_uA / 100.0f) * 1000.0f;
+#if CONFIG_OTL_SENSOR_DEBUG
+    OTL_LOGI_PERIODIC("sensor", "ALS raw=%d V=%.3fV Iph=%.1fuA lux=%.1f", raw, voltage, iph_uA, lux);
+#endif
+    return lux;
 }
 
 static float __attribute__((unused)) read_ntc_temperature(void)
@@ -1209,7 +1429,9 @@ static float __attribute__((unused)) read_ntc_temperature(void)
 
     float r  = series_resistor * (v / (3.3f - v));
 
-    OTL_LOGI("sensor", "NTC raw=%d, V=%.3f, R=%.1f", raw, v, r);
+#if CONFIG_OTL_SENSOR_DEBUG
+    OTL_LOGI_PERIODIC("sensor", "NTC raw=%d V=%.3fV R=%.1fohm", raw, v, r);
+#endif
 
     if (r <= 0) return NAN;
 
@@ -1358,18 +1580,32 @@ static void touch_task(void *arg)
     while (1) {
         uint32_t pad_intr = 0;
         uint32_t now = esp_timer_get_time() / 1000; // Current time in ms
+        uint32_t raw_now[PAD_COUNT] = {0};
 
         // Poll raw values and generate edge events (rising edges) for each pad.
         for (int i = 0; i < PAD_COUNT; ++i) {
-            uint32_t raw = 0;
-            touch_pad_read_raw_data(touch_pads[i], &raw);
-            pressed_now[i] = (raw > threshold[i]);
+            touch_pad_read_raw_data(touch_pads[i], &raw_now[i]);
+            pressed_now[i] = (raw_now[i] > threshold[i]);
 
             // Rising edge -> treat as a new tap/press event.
             if (pressed_now[i] && !prev_pressed[i]) {
                 pad_intr |= (1UL << touch_pads[i]);
             }
         }
+
+#if CONFIG_OTL_SERIAL_OUTPUT && CONFIG_OTL_LOG_TOUCH_RAW
+        static uint32_t last_touch_raw_log_ms = 0;
+        if ((now - last_touch_raw_log_ms) >= (uint32_t)CONFIG_OTL_TOUCH_RAW_LOG_INTERVAL_MS) {
+            last_touch_raw_log_ms = now;
+            OTL_LOGI_PERIODIC("touch_raw",
+                              "PWR=%lu/%lu B+=%lu/%lu B-=%lu/%lu T+=%lu/%lu T-=%lu/%lu",
+                              (unsigned long)raw_now[0], (unsigned long)threshold[0],
+                              (unsigned long)raw_now[1], (unsigned long)threshold[1],
+                              (unsigned long)raw_now[2], (unsigned long)threshold[2],
+                              (unsigned long)raw_now[3], (unsigned long)threshold[3],
+                              (unsigned long)raw_now[4], (unsigned long)threshold[4]);
+        }
+#endif
 
         // --- LED ON/OFF + optional NeoPixel enable on long-hold ---
         // NeoPixel is always off by default. To enable it, turn the light on
@@ -1385,13 +1621,13 @@ static void touch_task(void *arg)
                 neopixel_enabled = false;
                 power_arm_neopixel = true;
                 update_outputs();
-                OTL_LOGI("touch", "LED turned: ON");
+                OTL_LOG_TOUCHI("LED turned: ON");
             } else {
                 led_state = false;
                 neopixel_enabled = false;
                 power_arm_neopixel = false;
                 update_outputs();
-                OTL_LOGI("touch", "LED turned: OFF");
+                OTL_LOG_TOUCHI("LED turned: OFF");
             }
         }
 
@@ -1399,7 +1635,7 @@ static void touch_task(void *arg)
             (now - power_press_ms) >= POWER_HOLD_NEOPIXEL_MS) {
             neopixel_enabled = true;
             update_outputs();
-            OTL_LOGI("touch", "NeoPixel enabled");
+            OTL_LOG_TOUCHI("NeoPixel enabled");
         }
 
         if (!power_pressed) {
@@ -1419,14 +1655,14 @@ static void touch_task(void *arg)
                 if (now - tap_last_ms[1] < DOUBLE_TAP_MS) {
                     brightness_percent = MAX_BRIGHTNESS_PERCENT;
                     update_outputs();
-                    OTL_LOGI("touch", "Brightness set to MAX (%d%%)", MAX_BRIGHTNESS_PERCENT);
+                    OTL_LOG_TOUCHI("Brightness set to MAX (%d%%)", MAX_BRIGHTNESS_PERCENT);
                     tap_last_ms[1] = now;
                 } else {
                     float prev_brightness = brightness_percent;
                     brightness_percent = fminf(brightness_percent + (float)BRIGHT_STEP, (float)MAX_BRIGHTNESS_PERCENT);
                     if (brightness_percent != prev_brightness) {
                         update_outputs();
-                        OTL_LOGI("touch", "Brightness increased to: %d%%", (int)lroundf(brightness_percent));
+                        OTL_LOG_TOUCHI("Brightness increased to: %d%%", (int)lroundf(brightness_percent));
                     }
                     tap_last_ms[1] = now;
                 }
@@ -1461,7 +1697,7 @@ static void touch_task(void *arg)
                 if ((brightness_percent >= MIN_BRIGHTNESS_PERCENT) && (now - tap_last_ms[2] < DOUBLE_TAP_MS)) {
                     brightness_percent = MIN_BRIGHTNESS_PERCENT;
                     update_outputs();
-                    OTL_LOGI("touch", "Brightness set to MIN (%d%%)", (int)lroundf(MIN_BRIGHTNESS_PERCENT));
+                    OTL_LOG_TOUCHI("Brightness set to MIN (%d%%)", (int)lroundf(MIN_BRIGHTNESS_PERCENT));
                     tap_last_ms[2] = now;
                 } else {
                     float prev_brightness = brightness_percent;
@@ -1469,7 +1705,7 @@ static void touch_task(void *arg)
                     brightness_percent = fmaxf(brightness_percent - (float)BRIGHT_STEP, min_limit);
                     if (brightness_percent != prev_brightness) {
                         update_outputs();
-                        OTL_LOGI("touch", "Brightness decreased to: %d%%", (int)lroundf(brightness_percent));
+                        OTL_LOG_TOUCHI("Brightness decreased to: %d%%", (int)lroundf(brightness_percent));
                     }
                     tap_last_ms[2] = now;
                 }
@@ -1487,13 +1723,13 @@ static void touch_task(void *arg)
                 if (now - tap_last_ms[3] < DOUBLE_TAP_MS) {
                     otl_set_temp_ratio(1.0f);
                     update_outputs();
-                    OTL_LOGI("touch", "Temperature set to MAX COOL (1.0)");
+                    OTL_LOG_TOUCHI("Temperature set to MAX COOL (1.0)");
                 } else {
                     float prev_temp = temp_ratio;
                     otl_adjust_temp_ratio(TEMP_STEP);
                     if (temp_ratio != prev_temp) {
                         update_outputs();
-                        OTL_LOGI("touch", "White temp increase: %.2f | Warm temp decrease: %.2f", 
+                        OTL_LOG_TOUCHI("White temp increase: %.2f | Warm temp decrease: %.2f", 
                                 temp_ratio, 1.0f - temp_ratio);
                     }
                 }
@@ -1511,13 +1747,13 @@ static void touch_task(void *arg)
                 if (now - tap_last_ms[4] < DOUBLE_TAP_MS) {
                     otl_set_temp_ratio(0.0f);
                     update_outputs();
-                    OTL_LOGI("touch", "Temperature set to MAX WARM (0.0)");
+                    OTL_LOG_TOUCHI("Temperature set to MAX WARM (0.0)");
                 } else {
                     float prev_temp = temp_ratio;
                     otl_adjust_temp_ratio(-TEMP_STEP);
                     if (temp_ratio != prev_temp) {
                         update_outputs();
-                        OTL_LOGI("touch", "Cool temp decrease: %.2f | Warm temp increase: %.2f", 
+                        OTL_LOG_TOUCHI("Cool temp decrease: %.2f | Warm temp increase: %.2f", 
                                 temp_ratio, 1.0f - temp_ratio);
                     }
                 }
@@ -1740,13 +1976,12 @@ static void radar_task(void *arg)
         // Log periodically so we can see what the radar is doing,
         // even if presence does not change.
         if (now_ms - last_log_ms > 2000) {
-            OTL_LOGI("radar",
-                     "presence=%s OUT14=%d OUT15=%d moving=%d stationary=%d movDist=%ucm statDist=%ucm",
-                     (radar_presence ? "ON" : "OFF"),
-                     out14_level, out15_level,
-                     moving ? 1 : 0, stationary ? 1 : 0,
-                     (unsigned)radar_last_sample.movingDist,
-                     (unsigned)radar_last_sample.staticDist);
+            OTL_LOG_RADARI("presence=%s OUT14=%d OUT15=%d moving=%d stationary=%d movDist=%ucm statDist=%ucm",
+                           (radar_presence ? "ON" : "OFF"),
+                           out14_level, out15_level,
+                           moving ? 1 : 0, stationary ? 1 : 0,
+                           (unsigned)radar_last_sample.movingDist,
+                           (unsigned)radar_last_sample.staticDist);
             last_log_ms = now_ms;
         }
 
@@ -1776,22 +2011,58 @@ static void radar_task(void *arg)
 // touch_debug_task removed - was only for debugging and was disabled
 
 // ---------------------------- Sensor task (ALS + NTC) -------------------------
-#if CONFIG_OTL_SERIAL_OUTPUT
 static void sensor_task(void *arg)
 {
+    (void)arg;
+    TickType_t last_wake = xTaskGetTickCount();
+#if CONFIG_OTL_SERIAL_OUTPUT && (CONFIG_OTL_LOG_STATUS || CONFIG_OTL_SENSOR_DEBUG)
+    uint32_t log_elapsed_ms = SENSOR_READ_INTERVAL_MS;
+#endif
+
     while (1) {
-        float lux  = read_als_lux();
         float ntc_temp  = read_ntc_temperature();
         float chip_temp = read_chip_temperature();
-        if (!isnan(chip_temp)) {
-            OTL_LOGI("sensor", "Ambient %.0f lux | NTC %.1f °C | Chip %.1f °C", lux, ntc_temp, chip_temp);
-        } else {
-            OTL_LOGI("sensor", "Ambient %.0f lux | NTC %.1f °C", lux, ntc_temp);
+
+        thermal_update(ntc_temp, chip_temp);
+
+#if CONFIG_OTL_SERIAL_OUTPUT && (CONFIG_OTL_LOG_STATUS || CONFIG_OTL_SENSOR_DEBUG)
+        log_elapsed_ms += THERMAL_POLL_INTERVAL_MS;
+        if (log_elapsed_ms >= SENSOR_READ_INTERVAL_MS) {
+            log_elapsed_ms = 0;
+            float lux = read_als_lux();
+#if CONFIG_OTL_LOG_STATUS
+            const char *light_state = led_state ? "ON" : "OFF";
+            float temp_cool_ratio = temp_ratio;
+            float temp_warm_ratio = 1.0f - temp_ratio;
+            if (!isnan(chip_temp)) {
+                OTL_LOG_STATUSI("Light %s | B %.0f%% | Temp %.2f (cool %.0f%%/warm %.0f%%) | Ambient %.0f lux | NTC %.1f °C | Chip %.1f °C",
+                                light_state,
+                                brightness_percent,
+                                temp_cool_ratio,
+                                temp_cool_ratio * 100.0f,
+                                temp_warm_ratio * 100.0f,
+                                lux,
+                                ntc_temp,
+                                chip_temp);
+            } else {
+                OTL_LOG_STATUSI("Light %s | B %.0f%% | Temp %.2f (cool %.0f%%/warm %.0f%%) | Ambient %.0f lux | NTC %.1f °C",
+                                light_state,
+                                brightness_percent,
+                                temp_cool_ratio,
+                                temp_cool_ratio * 100.0f,
+                                temp_warm_ratio * 100.0f,
+                                lux,
+                                ntc_temp);
+            }
+#else
+            (void)lux;
+#endif
         }
-        vTaskDelay(pdMS_TO_TICKS(SENSOR_READ_INTERVAL_MS));
+#endif
+
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(THERMAL_POLL_INTERVAL_MS));
     }
 }
-#endif
 
 // ---------------------------- app_main ----------------------------------------
 // Remove all timer-related code from app_main()
@@ -1849,6 +2120,18 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(esp_timer_create(&pwm_timer_args, &pwm_nonoverlap_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(pwm_nonoverlap_timer, PWM_SOFT_FADE_UPDATE_US));
+#endif
+
+#if CONFIG_OTL_SERIAL_OUTPUT && CONFIG_OTL_LOG_PWM_DUTY
+    const esp_timer_create_args_t pwm_log_timer_args = {
+        .callback = &pwm_log_timer_cb,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "pwm_log",
+        .skip_unhandled_events = true,
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&pwm_log_timer_args, &pwm_log_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(pwm_log_timer, (uint64_t)CONFIG_OTL_PWM_LOG_INTERVAL_MS * 1000ULL));
 #endif
 
     // 2. WS2812 via RMT LED-Strip driver
@@ -1948,9 +2231,8 @@ void app_main(void)
     adc_init();
 
     // 5b. ESP32 internal temperature sensor
-#if CONFIG_OTL_SERIAL_OUTPUT
     chip_temp_init();
-#endif
+    thermal_brightness_cap_percent = (float)MAX_BRIGHTNESS_PERCENT;
 
 #if CONFIG_OTL_CIRCADIAN_ENABLE
     esp_err_t circadian_err = otl_circadian_start(otl_circadian_apply_cb, NULL);
@@ -1963,9 +2245,7 @@ void app_main(void)
     // touch_task and radar_task need larger stacks due to complex state
     // sensor_task and recalib_task are simpler and can use smaller stacks
     xTaskCreate(touch_task, "touch_task", 4096, NULL, 5, NULL);
-#if CONFIG_OTL_SERIAL_OUTPUT
     xTaskCreate(sensor_task, "sensor_task", 2560, NULL, 5, NULL);
-#endif
     xTaskCreate(recalibration_task, "recalib_task", 2560, NULL, 2, NULL);
 #if CONFIG_OTL_PRESENCE_SENSOR
     xTaskCreate(radar_task, "radar_task", 4096, NULL, 4, NULL);

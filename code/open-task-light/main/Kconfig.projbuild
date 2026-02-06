@@ -1,5 +1,7 @@
 menu "Open Task Light"
 
+menu "Serial logging"
+
 config OTL_SERIAL_OUTPUT
     bool "Enable serial log output"
     default y
@@ -9,6 +11,75 @@ config OTL_SERIAL_OUTPUT
         (Boot/ROM logs may still appear; use the ESP-IDF log output settings
         to disable those.)
 
+menu "Serial logging options"
+    depends on OTL_SERIAL_OUTPUT
+
+config OTL_LOG_STATUS
+    bool "Enable periodic status logs (every 10s)"
+    default y
+    help
+        Enables the periodic status line printed by the sensor task (light
+        state, brightness/temp, ALS lux, NTC/chip temperature).
+
+config OTL_SENSOR_DEBUG
+    bool "Enable sensor debug logs (raw ADC)"
+    default n
+    help
+        Logs raw ADC values and computed voltages for the ALS/NTC sensors.
+        Useful when debugging wiring/pin mapping (e.g., always reading 0 or 4095).
+
+config OTL_LOG_TOUCH_EVENTS
+    bool "Enable touch UI event logs"
+    default y
+    help
+        Logs touch-driven UI events (on/off, brightness changes, temp changes).
+
+config OTL_LOG_TOUCH_CAL
+    bool "Enable touch calibration logs"
+    default y
+    help
+        Logs touch calibration output (baseline/threshold) at startup and during
+        periodic recalibration.
+
+config OTL_LOG_TOUCH_RAW
+    bool "Enable raw touch pad value logs"
+    default n
+    help
+        Logs raw capacitive touch values and thresholds for each pad at a fixed
+        interval. Useful when tuning thresholds or debugging grounding/noise.
+
+config OTL_TOUCH_RAW_LOG_INTERVAL_MS
+    int "Raw touch log interval (ms)"
+    depends on OTL_LOG_TOUCH_RAW
+    range 10 5000
+    default 200
+
+config OTL_LOG_PWM_DUTY
+    bool "Enable PWM duty logs during transitions"
+    default n
+    help
+        Logs warm/cool PWM duty (and targets) while outputs are changing.
+        Useful for debugging dimming ramps, fades, and hold behavior.
+
+config OTL_PWM_LOG_INTERVAL_MS
+    int "PWM duty log interval (ms)"
+    depends on OTL_LOG_PWM_DUTY
+    range 5 5000
+    default 50
+
+config OTL_LOG_RADAR_STATUS
+    bool "Enable presence sensor status logs"
+    depends on OTL_PRESENCE_SENSOR
+    default y
+    help
+        Logs periodic presence sensor status (OUT pins + moving/stationary
+        distances). Disable to keep serial output quiet while still using
+        presence-based dimming behavior.
+
+endmenu
+
+endmenu
+
 config OTL_PRESENCE_SENSOR
     bool "Enable presence sensor (LD2410B)"
     default y
@@ -16,6 +87,8 @@ config OTL_PRESENCE_SENSOR
         Enables the LD2410B presence sensor support (GPIO OUT + optional UART
         frame parsing) and occupancy-based fade in/out behavior.
         Disable if the sensor is not installed.
+
+menu "PWM"
 
 config OTL_NONOVERLAP_PWM
     bool "Non-overlapping warm/cool PWM"
@@ -26,6 +99,10 @@ config OTL_NONOVERLAP_PWM
         This can reduce peak current draw and audible/EMI artifacts.
         Note: this currently disables LEDC hardware fade for those channels.
 
+endmenu
+
+menu "Circadian lighting"
+
 config OTL_CIRCADIAN_ENABLE
     bool "Enable circadian color temperature (WiFi + SNTP)"
     default n
@@ -34,7 +111,7 @@ config OTL_CIRCADIAN_ENABLE
         the warm/cool mix over a 24-hour cycle: cooler during the day and
         warmer as evening/night approaches.
 
-menu "Circadian Lighting"
+menu "Circadian settings"
     depends on OTL_CIRCADIAN_ENABLE
 
 config OTL_WIFI_SSID
@@ -85,6 +162,8 @@ config OTL_CIRCADIAN_COOL_MAX_PCT
     int "Maximum cool ratio (%)"
     range 0 100
     default 100
+
+endmenu
 
 endmenu
 

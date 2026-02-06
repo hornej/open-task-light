@@ -24,6 +24,13 @@ idf.py -p PORT flash monitor
 
 Menuconfig options under `Open Task Light`:
 - `Enable serial log output` (`CONFIG_OTL_SERIAL_OUTPUT`)
+- `Enable periodic status logs (every 10s)` (`CONFIG_OTL_LOG_STATUS`)
+- `Enable sensor debug logs (raw ADC)` (`CONFIG_OTL_SENSOR_DEBUG`)
+- `Enable touch UI event logs` (`CONFIG_OTL_LOG_TOUCH_EVENTS`)
+- `Enable touch calibration logs` (`CONFIG_OTL_LOG_TOUCH_CAL`)
+- `Enable raw touch pad value logs` (`CONFIG_OTL_LOG_TOUCH_RAW`) + `Raw touch log interval (ms)` (`CONFIG_OTL_TOUCH_RAW_LOG_INTERVAL_MS`)
+- `Enable PWM duty logs during transitions` (`CONFIG_OTL_LOG_PWM_DUTY`) + `PWM duty log interval (ms)` (`CONFIG_OTL_PWM_LOG_INTERVAL_MS`)
+- `Enable presence sensor status logs` (`CONFIG_OTL_LOG_RADAR_STATUS`)
 - `Enable presence sensor (LD2410B)` (`CONFIG_OTL_PRESENCE_SENSOR`)
 - `Non-overlapping warm/cool PWM` (`CONFIG_OTL_NONOVERLAP_PWM`)
 - `Enable circadian color temperature (WiFi + SNTP)` (`CONFIG_OTL_CIRCADIAN_ENABLE`)
