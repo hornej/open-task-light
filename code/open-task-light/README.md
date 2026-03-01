@@ -32,12 +32,14 @@ Menuconfig options under `Open Task Light`:
 - `Enable PWM duty logs during transitions` (`CONFIG_OTL_LOG_PWM_DUTY`) + `PWM duty log interval (ms)` (`CONFIG_OTL_PWM_LOG_INTERVAL_MS`)
 - `Enable presence sensor status logs` (`CONFIG_OTL_LOG_RADAR_STATUS`)
 - `Enable presence sensor (LD2410B)` (`CONFIG_OTL_PRESENCE_SENSOR`)
+- `Radar detection` submenu (distance thresholds, on/off delays, task interval)
 - `Non-overlapping warm/cool PWM` (`CONFIG_OTL_NONOVERLAP_PWM`)
 - `Enable circadian color temperature (WiFi + SNTP)` (`CONFIG_OTL_CIRCADIAN_ENABLE`)
 
 Circadian notes:
 - Set `WiFi SSID`, `WiFi Password`, and a POSIX `Timezone` string (examples: `PST8PDT,M3.2.0/2,M11.1.0/2`, `EST5EDT,M3.2.0/2,M11.1.0/2`, `UTC0`).
-- The firmware syncs time via SNTP and updates the warm/cool mix smoothly across the day (cooler midday, warmer evenings/night).
+- Set both `Coolest time (HH:MM)` and `Warmest time (HH:MM)` to shape when the color temperature reaches each extreme (for example `09:00` and `19:30`).
+- The firmware syncs time via SNTP and updates the warm/cool mix smoothly across the day.
 - When enabled, the temperature touch buttons act as a user offset on top of the circadian schedule.
 
 Notes:

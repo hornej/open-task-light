@@ -139,19 +139,121 @@ static bool time_is_valid(void)
     return timeinfo.tm_year >= (2020 - 1900);
 }
 
-static float circadian_compute_cool_ratio(const struct tm *local_time)
+static void log_time_sync_success(void)
+{
+    time_t now = 0;
+    struct tm timeinfo = {0};
+    char ts[32] = {0};
+
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    if (strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &timeinfo) == 0) {
+        ESP_LOGI(TAG, "SNTP time sync complete");
+        return;
+    }
+
+    ESP_LOGI(TAG,
+             "SNTP time sync complete: %s (%s via %s)",
+             ts,
+             CONFIG_OTL_TIMEZONE,
+             CONFIG_OTL_SNTP_SERVER);
+}
+
+#define SECONDS_PER_DAY 86400
+
+static bool parse_hhmm_time(const char *value, int *seconds_out)
+{
+    if (value == NULL || seconds_out == NULL) {
+        return false;
+    }
+
+    const char *colon = strchr(value, ':');
+    if (colon == NULL) {
+        return false;
+    }
+    if (strchr(colon + 1, ':') != NULL) {
+        return false;
+    }
+
+    char *endptr = NULL;
+    long hour = strtol(value, &endptr, 10);
+    if (endptr != colon) {
+        return false;
+    }
+
+    long minute = strtol(colon + 1, &endptr, 10);
+    if (endptr == (colon + 1) || *endptr != '\0') {
+        return false;
+    }
+
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+        return false;
+    }
+
+    *seconds_out = (int)(hour * 3600L + minute * 60L);
+    return true;
+}
+
+static int parse_config_time_or_fallback(const char *config_value,
+                                         int fallback_seconds,
+                                         const char *config_name)
+{
+    int parsed_seconds = 0;
+    if (parse_hhmm_time(config_value, &parsed_seconds)) {
+        return parsed_seconds;
+    }
+
+    int fb_hour = fallback_seconds / 3600;
+    int fb_minute = (fallback_seconds % 3600) / 60;
+    ESP_LOGW(TAG,
+             "%s has invalid HH:MM value '%s'; using fallback %02d:%02d",
+             config_name,
+             (config_value != NULL) ? config_value : "",
+             fb_hour,
+             fb_minute);
+    return fallback_seconds;
+}
+
+static float circadian_compute_cool_ratio(const struct tm *local_time,
+                                          int coolest_sec,
+                                          int warmest_sec)
 {
     const int sec_of_day = (local_time->tm_hour * 3600) + (local_time->tm_min * 60) + local_time->tm_sec;
-    const int peak_sec = (CONFIG_OTL_CIRCADIAN_PEAK_HOUR * 3600) + (CONFIG_OTL_CIRCADIAN_PEAK_MINUTE * 60);
 
     const float min_ratio = clampf((float)CONFIG_OTL_CIRCADIAN_COOL_MIN_PCT / 100.0f, 0.0f, 1.0f);
     const float max_ratio = clampf((float)CONFIG_OTL_CIRCADIAN_COOL_MAX_PCT / 100.0f, 0.0f, 1.0f);
     const float lo = (min_ratio <= max_ratio) ? min_ratio : max_ratio;
     const float hi = (min_ratio <= max_ratio) ? max_ratio : min_ratio;
 
-    const float seconds_delta = (float)(sec_of_day - peak_sec);
-    const float phase = (2.0f * (float)M_PI * seconds_delta) / 86400.0f;
-    const float base = 0.5f + 0.5f * cosf(phase);  // 1 @ peak, 0 @ peak+12h
+    float base = 0.0f;
+    if (coolest_sec == warmest_sec) {
+        // Fallback for invalid configuration: keep a 24h sinusoid with coolest
+        // at the configured peak and warmest 12h later.
+        const float seconds_delta = (float)(sec_of_day - coolest_sec);
+        const float phase = (2.0f * (float)M_PI * seconds_delta) / (float)SECONDS_PER_DAY;
+        base = 0.5f + 0.5f * cosf(phase);  // 1 @ coolest, 0 @ coolest+12h
+    } else {
+        // Piecewise cosine interpolation between warmest and coolest times.
+        int rise_duration_sec = coolest_sec - warmest_sec;
+        if (rise_duration_sec < 0) {
+            rise_duration_sec += SECONDS_PER_DAY;
+        }
+
+        int elapsed_from_warmest = sec_of_day - warmest_sec;
+        if (elapsed_from_warmest < 0) {
+            elapsed_from_warmest += SECONDS_PER_DAY;
+        }
+
+        if (elapsed_from_warmest <= rise_duration_sec) {
+            float t = (float)elapsed_from_warmest / (float)rise_duration_sec; // 0..1
+            base = 0.5f - 0.5f * cosf((float)M_PI * t);                        // 0->1
+        } else {
+            const int fall_duration_sec = SECONDS_PER_DAY - rise_duration_sec;
+            const int elapsed_fall = elapsed_from_warmest - rise_duration_sec;
+            float t = (float)elapsed_fall / (float)fall_duration_sec;          // 0..1
+            base = 0.5f + 0.5f * cosf((float)M_PI * t);                        // 1->0
+        }
+    }
 
     return clampf(lo + (hi - lo) * base, 0.0f, 1.0f);
 }
@@ -208,6 +310,16 @@ static void circadian_task(void *arg)
         ESP_LOGI(TAG, "Waiting for SNTP time sync...");
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
+    log_time_sync_success();
+
+    const int coolest_sec = parse_config_time_or_fallback(
+        CONFIG_OTL_CIRCADIAN_COOLEST_TIME,
+        11 * 3600,
+        "CONFIG_OTL_CIRCADIAN_COOLEST_TIME");
+    const int warmest_sec = parse_config_time_or_fallback(
+        CONFIG_OTL_CIRCADIAN_WARMEST_TIME,
+        23 * 3600,
+        "CONFIG_OTL_CIRCADIAN_WARMEST_TIME");
 
     float last_ratio = -1.0f;
     while (1) {
@@ -217,7 +329,7 @@ static void circadian_task(void *arg)
         localtime_r(&now, &timeinfo);
 
         if (timeinfo.tm_year >= (2020 - 1900)) {
-            float ratio = circadian_compute_cool_ratio(&timeinfo);
+            float ratio = circadian_compute_cool_ratio(&timeinfo, coolest_sec, warmest_sec);
             if (last_ratio < 0.0f || fabsf(ratio - last_ratio) >= 0.0005f) {
                 last_ratio = ratio;
                 if (s_apply_cb != NULL) {

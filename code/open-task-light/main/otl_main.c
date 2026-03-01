@@ -882,16 +882,12 @@ static float saved_temp_ratio     = 0.5f;
 #endif
 // Presence as determined from radar UART + OUT pin
 static bool radar_presence        = false;
-// Maximum distance (in cm) for presence to count when using UART data.
-// For moving targets we use a tighter radius (3.0 m), for stationary
-// targets we allow a bit further.
-static const uint16_t RADAR_MOVING_NEAR_MAX_CM   = 300;  // 3.0 m
-static const uint16_t RADAR_PRESENCE_MAX_DIST_CM = 500;  // 5.0 m for stationary
-// How long absence must persist before we dim/turn off (ms)
-static const uint32_t RADAR_ABSENCE_TIMEOUT_MS   = 30000;
-// How long continuous presence must persist before we treat the room as
-// occupied again and turn the light back on (ms)
-static const uint32_t RADAR_PRESENCE_ON_DELAY_MS = 3000;
+// Detection and hysteresis tuning from menuconfig -> Open Task Light -> Radar detection.
+#define RADAR_MOVING_NEAR_MAX_CM      ((uint16_t)CONFIG_OTL_RADAR_MOVING_MAX_DISTANCE_CM)
+#define RADAR_PRESENCE_MAX_DIST_CM    ((uint16_t)CONFIG_OTL_RADAR_STATIONARY_MAX_DISTANCE_CM)
+#define RADAR_PRESENCE_ON_DELAY_MS    ((uint32_t)CONFIG_OTL_RADAR_PRESENCE_ON_DELAY_MS)
+#define RADAR_ABSENCE_TIMEOUT_MS      ((uint32_t)CONFIG_OTL_RADAR_ABSENCE_TIMEOUT_MS)
+#define RADAR_TASK_LOOP_INTERVAL_MS   ((uint32_t)CONFIG_OTL_RADAR_TASK_LOOP_MS)
 #endif
 
 // ---------------------------- Touch baseline/threshold -------------------------
@@ -2003,7 +1999,11 @@ static void radar_task(void *arg)
             radar_occupied = false;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(50));
+        TickType_t delay_ticks = pdMS_TO_TICKS(RADAR_TASK_LOOP_INTERVAL_MS);
+        if (delay_ticks == 0) {
+            delay_ticks = 1;
+        }
+        vTaskDelay(delay_ticks);
     }
 }
 #endif
