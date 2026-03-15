@@ -1,11 +1,6 @@
-// main.c – ESP‑IDF skeleton that mirrors your Arduino sketch
-// Tested with ESP‑IDF v5.x on an ESP32‑S3 module
-// -----------------------------------------------------------
-// This is NOT a drop‑in replacement: it is a structured starting
-// point that compiles under idf.py and retains the logic of your
-// original sketch (PWM dimming, capacitive‑touch UI, WS2812 RGB
-// status LED, ADC sensors).  Flesh out the TODOs as you verify
-// hardware pin‑mapping and tweak thresholds.
+// otl_main.c - Open Task Light firmware (ESP-IDF, ESP32-S3)
+// PWM dimming, capacitive-touch UI, WS2812 RGB status LED, ADC sensors,
+// optional LD2410B presence sensor, optional circadian color temperature.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -99,9 +94,10 @@ static const char *otl_log_localtime(char *buf, size_t buf_len)
 #include "esp_intr_alloc.h"
 #include "otl_circadian.h"
 
-// Touch event queue removed - using polling-based approach in touch_task()
-
-
+// ADC_ATTEN_DB_11 was renamed to ADC_ATTEN_DB_12 in ESP-IDF v5.2+.
+#ifndef ADC_ATTEN_DB_12
+#define ADC_ATTEN_DB_12 ADC_ATTEN_DB_11
+#endif
 
 static adc_cali_handle_t adc2_cali_handle = NULL;
 
@@ -166,7 +162,7 @@ static inline uint32_t clamp_u32(uint32_t v, uint32_t lo, uint32_t hi)
 #define RADAR_RX_GPIO      44   // ESP32 RX (GPIO44) <- radar TX (module pin 40)
 #endif
 
-#define DIM_OUT_COOL_GPIO  36   // PWM output for cool white (verify that GPIO36 is routed to LEDC-capable pad on S3)
+#define DIM_OUT_COOL_GPIO  36   // PWM output for cool white
 #define DIM_OUT_WARM_GPIO  35   // PWM output for warm white
 #define WS2812_GPIO        40   // RMT / LED-Strip output pin
 
@@ -362,9 +358,6 @@ static void pwm_set_duty_smooth_timed(ledc_mode_t speed_mode, ledc_channel_t cha
     }
 
     uint32_t delta = (current_duty > target_duty) ? (current_duty - target_duty) : (target_duty - current_duty);
-    if (delta == 0) {
-        return;
-    }
 
     uint32_t total_cycles = (uint32_t)(((uint64_t)ledc_timer_cfg.freq_hz * target_time_ms) / 1000ULL);
     if (total_cycles < delta) {
@@ -998,7 +991,6 @@ static void recalibration_task(void *arg)
 // Parse incoming LD2410 frames into radar_last_sample, similar to LD2410B.ino.
 static void radar_parse_frames(void)
 {
-    bool any = false;
     size_t i = 0;
 
     while (i + 10 <= radar_rx_len) {
@@ -1050,7 +1042,6 @@ static void radar_parse_frames(void)
 
         if (s.valid) {
             radar_last_sample = s;
-            any = true;
         }
 
         // Consume this frame from the buffer
@@ -1070,12 +1061,8 @@ static void radar_parse_frames(void)
         radar_rx_len = 0;
     }
 
-    (void)any; // currently unused, but kept for future logging if needed
 }
 #endif
-
-// Touch ISR removed - using polling-based approach in touch_task() for simplicity
-// and to avoid slow peripheral reads in interrupt context
 
 // ---------------------------- Helper functions ---------------------------------
 static void ws2812_set_rgb(uint8_t r, uint8_t g, uint8_t b)
@@ -1241,48 +1228,10 @@ static void update_outputs(void)
         return;
     }
 
-    // Apply gamma correction so that brightness_percent feels more linear
-    // to human perception for both PWM and WS2812 output.
-    //
-    // Shift the physical mapping so that 1% brightness produces roughly
-    // the same PWM duty as the old 10% level, while still allowing 2%,
-    // 3%, ... to be progressively brighter. Also clamp the physical max
-    // to MAX_BRIGHTNESS_PERCENT to avoid overheating.
-    float b = brightness_percent;
-    if (b < HOLD_MIN_BRIGHTNESS_PERCENT) b = HOLD_MIN_BRIGHTNESS_PERCENT;
+    // Clamp brightness to thermal cap, then convert to PWM duty via gamma curve.
     float b_cap = clampf((float)thermal_brightness_cap_percent, HOLD_MIN_BRIGHTNESS_PERCENT, (float)MAX_BRIGHTNESS_PERCENT);
-    if (b > b_cap) b = b_cap;
-
-    float gamma_scaled = 0.0f;
-    if (b < MIN_BRIGHTNESS_PERCENT) {
-        float linear_min = (MIN_BRIGHTNESS_PERCENT + (float)MIN_BRIGHTNESS_OFFSET_PERCENT) / 100.0f;
-        if (linear_min < 0.0f) linear_min = 0.0f;
-        if (linear_min > 1.0f) linear_min = 1.0f;
-        float duty_at_min = powf(linear_min, GAMMA_CORRECTION);
-
-        float t = b / MIN_BRIGHTNESS_PERCENT; // 0..1
-        if (t < 0.0f) t = 0.0f;
-        if (t > 1.0f) t = 1.0f;
-        gamma_scaled = HOLD_MIN_PWM_DUTY_RATIO + t * (duty_at_min - HOLD_MIN_PWM_DUTY_RATIO);
-    } else {
-        float linear = (b + (float)MIN_BRIGHTNESS_OFFSET_PERCENT) / 100.0f;  // 1% -> ~0.15, 2% -> ~0.16, ...
-        if (linear < 0.0f) linear = 0.0f;
-        if (linear > 1.0f) linear = 1.0f;
-        gamma_scaled = powf(linear, GAMMA_CORRECTION);
-    }
-
-    // Hard cap on physical PWM duty to limit maximum output/heat.
-    // Note: MAX_BRIGHTNESS_PERCENT is a user-facing "%", but after gamma/offset
-    // it may otherwise exceed that duty ratio unless we clamp here.
-    float max_gamma_scaled = (float)MAX_BRIGHTNESS_PERCENT / 100.0f;
-    if (gamma_scaled > max_gamma_scaled) {
-        gamma_scaled = max_gamma_scaled;
-    }
-
-    uint32_t total_duty = (uint32_t)(gamma_scaled * PWM_MAX_DUTY);
-    if (total_duty != 0 && total_duty < PWM_MIN_ON_DUTY) {
-        total_duty = PWM_MIN_ON_DUTY;
-    }
+    float b = clampf(brightness_percent, HOLD_MIN_BRIGHTNESS_PERCENT, b_cap);
+    uint32_t total_duty = brightness_percent_to_total_duty(b);
     pwm_hold_target_total_duty = total_duty;
 
     if (!pwm_hold_stepper_enabled) {
@@ -1298,9 +1247,10 @@ static void update_outputs(void)
     }
 
     if (neopixel_enabled) {
-        uint8_t ws_brightness = (uint8_t)(gamma_scaled * 255.0f + 0.5f);
-        uint8_t red  = (1.0f - temp_ratio) * ws_brightness;
-        uint8_t blue = temp_ratio * ws_brightness;
+        float duty_ratio = (float)total_duty / (float)PWM_MAX_DUTY;
+        uint8_t ws_brightness = (uint8_t)(duty_ratio * 255.0f + 0.5f);
+        uint8_t red  = (uint8_t)((1.0f - temp_ratio) * ws_brightness);
+        uint8_t blue = (uint8_t)(temp_ratio * ws_brightness);
         ws2812_set_rgb(red, 0, blue);
     } else {
         ws2812_set_rgb(0, 0, 0);
@@ -1310,8 +1260,8 @@ static void update_outputs(void)
 // ---------------------------- ADC helpers (ALS + NTC) --------------------------
 static adc_oneshot_unit_handle_t adc1_handle;
 static adc_oneshot_unit_handle_t adc2_handle;
-static const adc_channel_t als_channel = ADC_CHANNEL_4;   // GPIO5 (verify on S3)
-static const adc_channel_t ntc_channel = ADC_CHANNEL_5;   // GPIO16 (verify)
+static const adc_channel_t als_channel = ADC_CHANNEL_4;   // GPIO5
+static const adc_channel_t ntc_channel = ADC_CHANNEL_5;   // GPIO16
 
 #if SOC_TEMP_SENSOR_SUPPORTED
 static temperature_sensor_handle_t chip_temp_handle = NULL;
@@ -1403,7 +1353,7 @@ static float __attribute__((unused)) read_als_lux(void)
     return lux;
 }
 
-static float __attribute__((unused)) read_ntc_temperature(void)
+static float read_ntc_temperature(void)
 {
     const float series_resistor = 10000.0f;
     const float nominal_res    = 10000.0f;
@@ -2008,8 +1958,6 @@ static void radar_task(void *arg)
 }
 #endif
 
-// touch_debug_task removed - was only for debugging and was disabled
-
 // ---------------------------- Sensor task (ALS + NTC) -------------------------
 static void sensor_task(void *arg)
 {
@@ -2065,7 +2013,6 @@ static void sensor_task(void *arg)
 }
 
 // ---------------------------- app_main ----------------------------------------
-// Remove all timer-related code from app_main()
 
 void app_main(void)
 {
