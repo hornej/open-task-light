@@ -22,6 +22,10 @@ idf.py build
 idf.py -p PORT flash monitor
 ```
 
+Checked-in defaults live in `sdkconfig.defaults`. Your `menuconfig` changes are
+written to the local `sdkconfig` file, which is intentionally ignored so Wi-Fi
+credentials and other machine-specific settings stay out of Git.
+
 Menuconfig options under `Open Task Light`:
 - `Enable serial log output` (`CONFIG_OTL_SERIAL_OUTPUT`)
 - `Enable periodic status logs (every 10s)` (`CONFIG_OTL_LOG_STATUS`)
@@ -56,18 +60,20 @@ esphome run esphome/open-task-light.yaml
 ```
 
 Notes:
+- `esphome/secrets.yaml` is intentionally ignored; keep your real Wi-Fi
+  credentials there.
 - Set `wifi.power_save_mode: none` to reduce command latency.
 - Set `logger.baud_rate: 0` to disable serial logs (use `115200` for debugging).
 - Use `use_address` if mDNS is unreliable in your network.
 - Optional: uncomment the LD2410B section in the YAML to enable presence sensing.
 
 ### Arduino
-Sketch: `arduino/otl.ino`
+Sketch: `arduino/otl/otl.ino`
 
 Optional radar test sketch: `arduino/LD2410B.ino`
 
 Quick start:
-1. Open `arduino/otl.ino` in the Arduino IDE.
+1. Open `arduino/otl/otl.ino` in the Arduino IDE.
 2. Select an ESP32-S3 board and install the `Adafruit NeoPixel` library.
 3. Build and upload.
 
@@ -94,5 +100,9 @@ Adjust pins to match your board wiring as needed.
 ## Repo layout
 
 - `arduino/` Arduino sketches
+- `components/` ESP-IDF reusable components such as the circadian controller
 - `esphome/` ESPHome configuration
+- `managed_components/` ESP-IDF managed dependencies
 - `main/` ESP-IDF firmware
+- `sdkconfig.defaults` checked-in ESP-IDF defaults
+- `tools/` helper scripts such as the PWM scope watcher

@@ -2,6 +2,8 @@ AGENTS.md
 FORJOSH.md
 agents.md
 forjosh.md
+firebase-debug.log
+sdkconfig.ci
 .vscode/settings.json
 .vscode/tasks.json
 .vscode/.browse.VC.db*
