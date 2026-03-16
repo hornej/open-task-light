@@ -13,7 +13,6 @@ under `code/open-task-light/` and the hardware reference files at the repo root.
 
 - `code/open-task-light/` firmware project
 - `pcb/` PCB PDFs and fabrication reference files
-- `working parts list.csv` top-level parts list
 - `LICENSE` project license
 
 ## Firmware
@@ -38,6 +37,9 @@ The `pcb/` folder currently contains:
 
 These are the board reference and fabrication outputs for the light.
 
+For current build details and project updates, see the Basement Labs page:
+- <https://www.basementlabs.net/open-task-light-2>
+
 ## Getting started
 
 If you are working on firmware:
@@ -53,7 +55,7 @@ are intentionally not tracked in Git.
 
 If you are working on hardware:
 - review the PDFs in `pcb/`
-- compare them with `working parts list.csv`
+- use the Basement Labs page for the current parts/build reference
 - keep firmware pin mappings aligned with the board wiring
 
 ## Notes
