@@ -132,11 +132,17 @@ static size_t  radar_rx_len = 0;
 
 // --- Application-wide timing constants ---
 #define TOUCH_MEAS_WAIT_MS        250   // Max wait for touch measurement to complete
-#define TOUCH_SETTLE_MS           100   // Delay for filter/FSM to settle before calibration
+#define TOUCH_SETTLE_MS           250   // Delay for filter/FSM to settle before calibration
 #define SENSOR_READ_INTERVAL_MS   10000 // Interval between sensor log lines
 #define THERMAL_POLL_INTERVAL_MS  1000  // Interval between thermal checks
 #define RECALIB_INTERVAL_MS       60000 // Interval between touch recalibration attempts
 #define RADAR_MAX_ENERGY          100   // Maximum energy value from LD2410 radar
+#define TOUCH_STARTUP_MAX_RETRIES 4     // Retry startup calibration if pads are still settling
+#define TOUCH_STARTUP_RETRY_MS    150   // Delay between startup calibration retries
+#define TOUCH_RECOVERY_DELAY_MS   2000  // Early post-boot recalibration pass
+#define TOUCH_VERIFY_DELAY_MS     100   // Delay between touch verification samples
+#define TOUCH_VERIFY_SAMPLES      3     // Consecutive samples required for a stuck-touch recovery
+#define TOUCH_BAD_PRESSED_PADS    3     // Number of simultaneously "pressed" pads treated as a bad calibration
 
 static inline uint32_t clamp_u32(uint32_t v, uint32_t lo, uint32_t hi)
 {
@@ -903,10 +909,56 @@ static uint32_t threshold[PAD_COUNT];
 #define TOUCH_NOISE_MULTIPLIER            6U
 #define TOUCH_THRESHOLD_MARGIN_MIN        250U
 #define TOUCH_THRESHOLD_MARGIN_MAX        2500U
+#define TOUCH_CAL_EDGE_SAMPLE_WINDOW      8
+#define TOUCH_CAL_MIN_VALID_SAMPLES       80
+#define TOUCH_CAL_MAX_DRIFT_MIN           300U
 static const float touch_threshold_margin_pct[PAD_COUNT] = { 0.05f, 0.03f, 0.03f, 0.03f, 0.03f };
 
-static void calibrate_touch_pads(void)
+typedef struct {
+    uint8_t low_valid_pads;
+    uint8_t drifting_pads;
+} touch_calibration_result_t;
+
+static void touch_read_raw_snapshot(uint32_t raw[PAD_COUNT])
 {
+    for (int i = 0; i < PAD_COUNT; ++i) {
+        touch_pad_read_raw_data(touch_pads[i], &raw[i]);
+    }
+}
+
+static int touch_count_pressed_from_raw(const uint32_t raw[PAD_COUNT])
+{
+    int pressed_count = 0;
+
+    for (int i = 0; i < PAD_COUNT; ++i) {
+        if (raw[i] > threshold[i]) {
+            pressed_count++;
+        }
+    }
+
+    return pressed_count;
+}
+
+static bool touch_confirm_pressed_count_at_least(int min_pressed)
+{
+    for (int sample = 0; sample < TOUCH_VERIFY_SAMPLES; ++sample) {
+        uint32_t raw[PAD_COUNT] = {0};
+        touch_read_raw_snapshot(raw);
+        if (touch_count_pressed_from_raw(raw) < min_pressed) {
+            return false;
+        }
+        if (sample + 1 < TOUCH_VERIFY_SAMPLES) {
+            vTaskDelay(pdMS_TO_TICKS(TOUCH_VERIFY_DELAY_MS));
+        }
+    }
+
+    return true;
+}
+
+static touch_calibration_result_t calibrate_touch_pads(void)
+{
+    touch_calibration_result_t result = {0};
+
     OTL_LOG_TOUCH_CALI("Calibrating touch pads (dynamic baseline/threshold)...");
 
     // Strategy adapted from the Arduino sketch:
@@ -917,9 +969,15 @@ static void calibrate_touch_pads(void)
     //    so we treat \"value ABOVE threshold\" as a touch
     for (int i = 0; i < PAD_COUNT; ++i) {
         uint64_t sum = 0;
+        uint64_t first_sum = 0;
+        uint64_t last_sum = 0;
         int valid_samples = 0;
+        int first_count = 0;
+        int last_count = 0;
+        int last_index = 0;
         uint32_t min_val = 0xFFFFFFFFu;
         uint32_t max_val = 0;
+        uint32_t last_samples[TOUCH_CAL_EDGE_SAMPLE_WINDOW] = {0};
 
         for (int s = 0; s < TOUCH_CAL_SAMPLES; ++s) {
             uint32_t val;
@@ -929,6 +987,19 @@ static void calibrate_touch_pads(void)
             if (val != 0) {
                 sum += val;
                 valid_samples++;
+                if (first_count < TOUCH_CAL_EDGE_SAMPLE_WINDOW) {
+                    first_sum += val;
+                    first_count++;
+                }
+                if (last_count < TOUCH_CAL_EDGE_SAMPLE_WINDOW) {
+                    last_sum += val;
+                    last_samples[last_count++] = val;
+                } else {
+                    last_sum -= last_samples[last_index];
+                    last_samples[last_index] = val;
+                    last_sum += val;
+                    last_index = (last_index + 1) % TOUCH_CAL_EDGE_SAMPLE_WINDOW;
+                }
                 if (val < min_val) min_val = val;
                 if (val > max_val) max_val = val;
             }
@@ -951,38 +1022,92 @@ static void calibrate_touch_pads(void)
         margin = clamp_u32(margin, TOUCH_THRESHOLD_MARGIN_MIN, TOUCH_THRESHOLD_MARGIN_MAX);
         threshold[i] = baseline[i] + margin;
 
+        uint32_t drift = 0;
+        if (first_count > 0 && last_count > 0) {
+            uint32_t first_avg = (uint32_t)(first_sum / (uint64_t)first_count);
+            uint32_t last_avg = (uint32_t)(last_sum / (uint64_t)last_count);
+            drift = (first_avg > last_avg) ? (first_avg - last_avg) : (last_avg - first_avg);
+            uint32_t allowed_drift = MAX(TOUCH_CAL_MAX_DRIFT_MIN, baseline[i] / 100U);
+            if (drift > allowed_drift) {
+                result.drifting_pads++;
+            }
+        }
+        if (valid_samples < TOUCH_CAL_MIN_VALID_SAMPLES) {
+            result.low_valid_pads++;
+        }
+
         ESP_ERROR_CHECK(touch_pad_set_thresh(touch_pads[i], threshold[i]));
 
-        OTL_LOG_TOUCH_CALI("Pad %d baseline=%lu threshold=%lu noise_span=%lu margin=%lu",
+        OTL_LOG_TOUCH_CALI("Pad %d baseline=%lu threshold=%lu noise_span=%lu margin=%lu drift=%lu valid=%d",
                  i,
                  (unsigned long)baseline[i],
                  (unsigned long)threshold[i],
                  (unsigned long)noise_span,
-                 (unsigned long)margin);
+                 (unsigned long)margin,
+                 (unsigned long)drift,
+                 valid_samples);
+    }
+
+    return result;
+}
+
+static void touch_calibrate_startup(void)
+{
+    for (int attempt = 1; attempt <= TOUCH_STARTUP_MAX_RETRIES; ++attempt) {
+        touch_calibration_result_t cal = calibrate_touch_pads();
+        bool bad_calibration = (cal.low_valid_pads > 0) ||
+                               (cal.drifting_pads > 0) ||
+                               touch_confirm_pressed_count_at_least(TOUCH_BAD_PRESSED_PADS);
+
+        if (!bad_calibration) {
+            if (attempt > 1) {
+                OTL_LOGI("touch", "Startup calibration stabilized on attempt %d", attempt);
+            }
+            return;
+        }
+
+        OTL_LOGW("touch",
+                 "Startup calibration retry %d/%d (low_valid=%u drifting=%u)",
+                 attempt,
+                 TOUCH_STARTUP_MAX_RETRIES,
+                 cal.low_valid_pads,
+                 cal.drifting_pads);
+
+        if (attempt < TOUCH_STARTUP_MAX_RETRIES) {
+            vTaskDelay(pdMS_TO_TICKS(TOUCH_STARTUP_RETRY_MS));
+        }
     }
 }
 
 static void recalibration_task(void *arg)
 {
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(TOUCH_RECOVERY_DELAY_MS));
+
     while (1) {
-        // Wait for a period with no touch activity
-        vTaskDelay(pdMS_TO_TICKS(RECALIB_INTERVAL_MS));
-        
-        // Only recalibrate if no buttons are being touched
-        bool can_recalibrate = true;
-        for (int i = 0; i < PAD_COUNT; ++i) {
-            uint32_t val;
-            touch_pad_read_raw_data(touch_pads[i], &val);
-            if (val > threshold[i]) {
-                can_recalibrate = false;
-                break;
+        if (touch_confirm_pressed_count_at_least(TOUCH_BAD_PRESSED_PADS)) {
+            OTL_LOGW("touch", "Multiple pads appear pressed at idle; forcing recalibration");
+            calibrate_touch_pads();
+        } else {
+            // Only recalibrate if no buttons are being touched
+            bool can_recalibrate = true;
+            uint32_t raw[PAD_COUNT] = {0};
+            touch_read_raw_snapshot(raw);
+            for (int i = 0; i < PAD_COUNT; ++i) {
+                if (raw[i] > threshold[i]) {
+                    can_recalibrate = false;
+                    break;
+                }
+            }
+
+            if (can_recalibrate) {
+                OTL_LOG_TOUCH_CALI("Performing periodic recalibration");
+                calibrate_touch_pads();
             }
         }
-        
-        if (can_recalibrate) {
-            OTL_LOG_TOUCH_CALI("Performing periodic recalibration");
-            calibrate_touch_pads();
-        }
+
+        // Wait for a period with no touch activity
+        vTaskDelay(pdMS_TO_TICKS(RECALIB_INTERVAL_MS));
     }
 }
 
@@ -2169,8 +2294,10 @@ void app_main(void)
     // Let the filter/FSM settle before sampling baselines.
     vTaskDelay(pdMS_TO_TICKS(TOUCH_SETTLE_MS));
 
-    // Calibrate touch pads using Arduino-style baseline/thresholds
-    calibrate_touch_pads();
+    // Calibrate touch pads using Arduino-style baseline/thresholds.
+    // Cold power-on can leave the touch front-end drifting for a short time,
+    // so validate the first calibration and retry if needed.
+    touch_calibrate_startup();
 
     // Using polling-based touch handling in touch_task() instead of ISR
 
