@@ -75,7 +75,7 @@ menu "Presence sensor"
 
 config OTL_PRESENCE_SENSOR
     bool "Enable presence sensor (LD2410B)"
-    default y
+    default n
     help
         Enables the LD2410B presence sensor support (GPIO OUT + optional UART
         frame parsing) and occupancy-based fade in/out behavior.

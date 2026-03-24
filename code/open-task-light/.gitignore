@@ -2,6 +2,11 @@ AGENTS.md
 FORJOSH.md
 agents.md
 forjosh.md
+local-config-profiles.md
+sdkconfig.local.shared
+sdkconfig.local.prod
+sdkconfig.local.debug
+sdkconfig.backup.*
 firebase-debug.log
 sdkconfig.ci
 .vscode/settings.json

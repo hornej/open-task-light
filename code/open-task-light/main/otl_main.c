@@ -595,10 +595,13 @@ static const float MIN_BRIGHTNESS_PERCENT = 5.0f;
 #define OTL_THERMAL_CHIP_HOT_C                   75.0f
 #define OTL_THERMAL_CHIP_HYST_C                  3.0f
 #define OTL_THERMAL_DIM_MAX_BRIGHTNESS_PERCENT   30.0f
+#define OTL_THERMAL_NTC_HOT_CONFIRM_POLLS        2
+#define OTL_NTC_SAMPLE_COUNT                     5
 
 static volatile bool thermal_ntc_hot = false;
 static volatile bool thermal_chip_hot = false;
 static volatile float thermal_brightness_cap_percent = 100.0f;
+static uint8_t thermal_ntc_hot_confirm_polls = 0;
 // While holding dim-down, allow a deeper range below the normal minimum.
 // HOLD_MIN_BRIGHTNESS_PERCENT is the internal floor used for holds; the mapping
 // below converts that to a physical PWM duty floor (HOLD_MIN_PWM_DUTY_RATIO).
@@ -1207,13 +1210,24 @@ static void thermal_update(float ntc_c, float chip_c)
     if (!isnan(ntc_c)) {
         if (!thermal_ntc_hot) {
             if (ntc_c >= OTL_THERMAL_NTC_HOT_C) {
-                thermal_ntc_hot = true;
+                if (thermal_ntc_hot_confirm_polls < 255) {
+                    thermal_ntc_hot_confirm_polls++;
+                }
+                if (thermal_ntc_hot_confirm_polls >= OTL_THERMAL_NTC_HOT_CONFIRM_POLLS) {
+                    thermal_ntc_hot = true;
+                    thermal_ntc_hot_confirm_polls = 0;
+                }
+            } else {
+                thermal_ntc_hot_confirm_polls = 0;
             }
         } else {
+            thermal_ntc_hot_confirm_polls = 0;
             if (ntc_c <= (OTL_THERMAL_NTC_HOT_C - OTL_THERMAL_NTC_HYST_C)) {
                 thermal_ntc_hot = false;
             }
         }
+    } else {
+        thermal_ntc_hot_confirm_polls = 0;
     }
 
     if (!isnan(chip_c)) {
@@ -1478,7 +1492,14 @@ static float __attribute__((unused)) read_als_lux(void)
     return lux;
 }
 
-static float read_ntc_temperature(void)
+static int compare_float_asc(const void *lhs, const void *rhs)
+{
+    const float a = *(const float *)lhs;
+    const float b = *(const float *)rhs;
+    return (a > b) - (a < b);
+}
+
+static float read_ntc_temperature_sample(void)
 {
     const float series_resistor = 10000.0f;
     const float nominal_res    = 10000.0f;
@@ -1508,6 +1529,26 @@ static float read_ntc_temperature(void)
 
     float st = logf(r / nominal_res) / b_coeff + 1.0f / (nominal_temp + 273.15f);
     return (1.0f / st) - 273.15f;
+}
+
+static float read_ntc_temperature(void)
+{
+    float samples[OTL_NTC_SAMPLE_COUNT] = {0};
+    size_t valid_count = 0;
+
+    for (size_t i = 0; i < OTL_NTC_SAMPLE_COUNT; ++i) {
+        float sample = read_ntc_temperature_sample();
+        if (!isnan(sample)) {
+            samples[valid_count++] = sample;
+        }
+    }
+
+    if (valid_count == 0) {
+        return NAN;
+    }
+
+    qsort(samples, valid_count, sizeof(samples[0]), compare_float_asc);
+    return samples[valid_count / 2];
 }
 
 
