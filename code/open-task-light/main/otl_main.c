@@ -8,6 +8,7 @@
 #include <string.h>     
 #include <time.h>
 #include "sdkconfig.h"
+#include "esp_idf_version.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -94,9 +95,10 @@ static const char *otl_log_localtime(char *buf, size_t buf_len)
 #include "esp_intr_alloc.h"
 #include "otl_circadian.h"
 
-// ADC_ATTEN_DB_11 was renamed to ADC_ATTEN_DB_12 in ESP-IDF v5.2+.
-#ifndef ADC_ATTEN_DB_12
-#define ADC_ATTEN_DB_12 ADC_ATTEN_DB_11
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0)
+#define OTL_ADC_ATTEN ADC_ATTEN_DB_12
+#else
+#define OTL_ADC_ATTEN ADC_ATTEN_DB_11
 #endif
 
 static adc_cali_handle_t adc2_cali_handle = NULL;
@@ -1453,7 +1455,7 @@ static void adc_init(void)
 
     adc_oneshot_chan_cfg_t chan_cfg = {
         .bitwidth = ADC_BITWIDTH_12,
-        .atten    = ADC_ATTEN_DB_12
+        .atten    = OTL_ADC_ATTEN
     };
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, als_channel, &chan_cfg));
 
@@ -1467,7 +1469,7 @@ static void adc_init(void)
     // Calibration for ADC2
     adc_cali_curve_fitting_config_t cali_config = {
         .unit_id = ADC_UNIT_2,
-        .atten = ADC_ATTEN_DB_12,
+        .atten = OTL_ADC_ATTEN,
         .bitwidth = ADC_BITWIDTH_12,
     };
     ESP_ERROR_CHECK(adc_cali_create_scheme_curve_fitting(&cali_config, &adc2_cali_handle));
