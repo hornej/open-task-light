@@ -585,12 +585,13 @@ static void otl_mqtt_publish_discovery(void)
 
     payload = otl_mqtt_alloc_printf(
         "{"
-        "\"name\":\"NTC Temperature\","
+        "\"name\":\"LED NTC Temperature\","
         "\"unique_id\":\"%s_ntc_temperature\","
         "\"state_topic\":\"%s\","
         "\"device_class\":\"temperature\","
         "\"unit_of_measurement\":\"°C\","
         "\"state_class\":\"measurement\","
+        "\"entity_category\":\"diagnostic\","
         "\"availability_topic\":\"%s\","
         "\"payload_available\":\"online\","
         "\"payload_not_available\":\"offline\","
