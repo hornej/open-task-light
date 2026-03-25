@@ -17,6 +17,7 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "mqtt_client.h"
+#include "otl_net.h"
 #include "otl_runtime.h"
 
 static const char *TAG = "otl_mqtt";
@@ -30,11 +31,22 @@ static const char *TAG = "otl_mqtt";
 #define OTL_MQTT_COOL_KELVIN           5000.0f
 #define OTL_MQTT_WARM_MIRED            (1000000.0f / OTL_MQTT_WARM_KELVIN)
 #define OTL_MQTT_COOL_MIRED            (1000000.0f / OTL_MQTT_COOL_KELVIN)
+#define OTL_MQTT_TASK_NAME             "otl_mqtt"
+#define OTL_MQTT_TASK_STACK_SIZE       4096
+#define OTL_MQTT_TASK_PRIORITY         4
+
+static esp_err_t otl_mqtt_build_topics(void);
+static void otl_mqtt_event_handler(void *handler_args,
+                                   esp_event_base_t base,
+                                   int32_t event_id,
+                                   void *event_data);
 
 typedef struct {
     esp_mqtt_client_handle_t client;
     bool started;
+    bool start_requested;
     bool connected;
+    bool listener_registered;
     char device_id[OTL_MQTT_DEVICE_ID_MAX];
     char light_unique_id[OTL_MQTT_UNIQUE_ID_MAX];
 #if CONFIG_OTL_PRESENCE_SENSOR
@@ -524,7 +536,7 @@ static void otl_mqtt_event_handler(void *handler_args,
     }
 }
 
-esp_err_t otl_mqtt_start(void)
+static esp_err_t otl_mqtt_init_client(void)
 {
     if (s_mqtt.started) {
         return ESP_OK;
@@ -547,9 +559,6 @@ esp_err_t otl_mqtt_start(void)
         return ESP_FAIL;
     }
 
-    ESP_RETURN_ON_ERROR(otl_state_add_listener(otl_mqtt_state_listener, NULL),
-                        TAG,
-                        "Failed to register state listener");
     ESP_RETURN_ON_ERROR(esp_mqtt_client_register_event(s_mqtt.client,
                                                        ESP_EVENT_ANY_ID,
                                                        otl_mqtt_event_handler,
@@ -560,6 +569,52 @@ esp_err_t otl_mqtt_start(void)
 
     s_mqtt.started = true;
     ESP_LOGI(TAG, "MQTT integration started");
+    return ESP_OK;
+}
+
+static void otl_mqtt_task(void *arg)
+{
+    (void)arg;
+
+    ESP_LOGI(TAG, "Waiting for WiFi before starting MQTT");
+    (void)otl_net_wait_for_wifi(portMAX_DELAY);
+
+    if (!otl_net_wifi_is_connected()) {
+        ESP_LOGE(TAG, "WiFi wait returned without an active connection");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    if (otl_mqtt_init_client() != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize MQTT client");
+    }
+
+    vTaskDelete(NULL);
+}
+
+esp_err_t otl_mqtt_start(void)
+{
+    if (s_mqtt.start_requested) {
+        return ESP_OK;
+    }
+
+    if (!s_mqtt.listener_registered) {
+        ESP_RETURN_ON_ERROR(otl_state_add_listener(otl_mqtt_state_listener, NULL),
+                            TAG,
+                            "Failed to register state listener");
+        s_mqtt.listener_registered = true;
+    }
+
+    if (xTaskCreate(otl_mqtt_task,
+                    OTL_MQTT_TASK_NAME,
+                    OTL_MQTT_TASK_STACK_SIZE,
+                    NULL,
+                    OTL_MQTT_TASK_PRIORITY,
+                    NULL) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_mqtt.start_requested = true;
     return ESP_OK;
 }
 
