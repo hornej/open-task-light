@@ -94,6 +94,7 @@ static const char *otl_log_localtime(char *buf, size_t buf_len)
 #include "freertos/queue.h"
 #include "esp_intr_alloc.h"
 #include "otl_circadian.h"
+#include "otl_homekit.h"
 #include "otl_mqtt.h"
 #include "otl_net.h"
 #include "otl_runtime.h"
@@ -2629,6 +2630,13 @@ void app_main(void)
     esp_err_t mqtt_err = otl_mqtt_start();
     if (mqtt_err != ESP_OK) {
         OTL_LOGE("mqtt", "Start failed: %s", esp_err_to_name(mqtt_err));
+    }
+#endif
+
+#if CONFIG_OTL_HOMEKIT_ENABLE
+    esp_err_t homekit_err = otl_homekit_start();
+    if (homekit_err != ESP_OK) {
+        OTL_LOGE("homekit", "Start failed: %s", esp_err_to_name(homekit_err));
     }
 #endif
 

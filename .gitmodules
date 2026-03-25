@@ -1,0 +1,3 @@
+[submodule "code/open-task-light/components/esp-homekit-sdk"]
+	path = code/open-task-light/components/esp-homekit-sdk
+	url = https://github.com/espressif/esp-homekit-sdk.git
