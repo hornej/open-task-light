@@ -70,6 +70,9 @@ typedef struct {
     char thermal_limited_discovery_topic[OTL_MQTT_TOPIC_MAX];
     char wifi_rssi_state_topic[OTL_MQTT_TOPIC_MAX];
     char wifi_rssi_discovery_topic[OTL_MQTT_TOPIC_MAX];
+    char led_thermal_limit_state_topic[OTL_MQTT_TOPIC_MAX];
+    char led_thermal_limit_command_topic[OTL_MQTT_TOPIC_MAX];
+    char led_thermal_limit_discovery_topic[OTL_MQTT_TOPIC_MAX];
 #if CONFIG_OTL_CIRCADIAN_ENABLE
     char circadian_enabled_state_topic[OTL_MQTT_TOPIC_MAX];
     char circadian_enabled_command_topic[OTL_MQTT_TOPIC_MAX];
@@ -164,6 +167,26 @@ static bool otl_mqtt_parse_int_payload(esp_mqtt_event_handle_t event, int *value
     }
 
     *value_out = (int)parsed;
+    return true;
+}
+
+static bool otl_mqtt_parse_float_payload(esp_mqtt_event_handle_t event, float *value_out)
+{
+    char payload[32] = {0};
+    char *endptr = NULL;
+    float parsed = 0.0f;
+
+    if (value_out == NULL || !otl_mqtt_copy_payload(event, payload, sizeof(payload))) {
+        return false;
+    }
+
+    otl_mqtt_trim(payload);
+    parsed = strtof(payload, &endptr);
+    if (endptr == payload || *endptr != '\0' || !isfinite(parsed)) {
+        return false;
+    }
+
+    *value_out = parsed;
     return true;
 }
 
@@ -426,6 +449,10 @@ static void otl_mqtt_publish_settings(const otl_runtime_settings_t *settings)
                      settings->circadian_warmest_time,
                      true);
 #endif
+    otl_mqtt_publish_float(s_mqtt.led_thermal_limit_state_topic,
+                           settings->led_thermal_limit_c,
+                           0,
+                           true);
     otl_mqtt_publish(s_mqtt.verbose_diag_state_topic,
                      settings->verbose_diagnostics_enabled ? "ON" : "OFF",
                      true);
@@ -701,6 +728,35 @@ static void otl_mqtt_publish_discovery(void)
         payload = NULL;
     }
 
+    payload = otl_mqtt_alloc_printf(
+        "{"
+        "\"name\":\"LED Thermal Limit\","
+        "\"unique_id\":\"%s_led_thermal_limit\","
+        "\"command_topic\":\"%s\","
+        "\"state_topic\":\"%s\","
+        "\"device_class\":\"temperature\","
+        "\"unit_of_measurement\":\"°C\","
+        "\"entity_category\":\"config\","
+        "\"min\":60,"
+        "\"max\":110,"
+        "\"step\":1,"
+        "\"mode\":\"box\","
+        "\"availability_topic\":\"%s\","
+        "\"payload_available\":\"online\","
+        "\"payload_not_available\":\"offline\","
+        "%s"
+        "}",
+        s_mqtt.device_id,
+        s_mqtt.led_thermal_limit_command_topic,
+        s_mqtt.led_thermal_limit_state_topic,
+        s_mqtt.availability_topic,
+        device_json);
+    if (payload != NULL) {
+        (void)otl_mqtt_publish_discovery_payload(s_mqtt.led_thermal_limit_discovery_topic, payload);
+        free(payload);
+        payload = NULL;
+    }
+
 #if CONFIG_OTL_CIRCADIAN_ENABLE
     payload = otl_mqtt_alloc_printf(
         "{"
@@ -938,6 +994,20 @@ static void otl_mqtt_handle_command(esp_mqtt_event_handle_t event)
     }
 #endif
 
+    if (otl_mqtt_topic_matches(event, s_mqtt.led_thermal_limit_command_topic)) {
+        float limit_c = 0.0f;
+        if (!otl_mqtt_parse_float_payload(event, &limit_c)) {
+            otl_event_emit(OTL_EVENT_LEVEL_WARNING, "mqtt", "Rejected LED thermal limit write");
+            otl_mqtt_republish_settings_after_invalid_write();
+            return;
+        }
+        if (otl_runtime_set_led_thermal_limit_c(limit_c, OTL_CHANGE_SOURCE_MQTT) != ESP_OK) {
+            otl_event_emit(OTL_EVENT_LEVEL_WARNING, "mqtt", "Rejected LED thermal limit write");
+            otl_mqtt_republish_settings_after_invalid_write();
+        }
+        return;
+    }
+
     if (otl_mqtt_topic_matches(event, s_mqtt.verbose_diag_command_topic)) {
         bool enabled = false;
         if (!otl_mqtt_parse_on_off_payload(event, &enabled)) {
@@ -1148,6 +1218,25 @@ static esp_err_t otl_mqtt_build_topics(void)
                                               s_mqtt.device_id),
                         TAG,
                         "MQTT RSSI discovery topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.led_thermal_limit_state_topic,
+                                              sizeof(s_mqtt.led_thermal_limit_state_topic),
+                                              "%s/thermal/led_limit/state",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT LED thermal limit state topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.led_thermal_limit_command_topic,
+                                              sizeof(s_mqtt.led_thermal_limit_command_topic),
+                                              "%s/thermal/led_limit/set",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT LED thermal limit command topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.led_thermal_limit_discovery_topic,
+                                              sizeof(s_mqtt.led_thermal_limit_discovery_topic),
+                                              "%s/number/%s_led_thermal_limit/config",
+                                              CONFIG_OTL_MQTT_DISCOVERY_PREFIX,
+                                              s_mqtt.device_id),
+                        TAG,
+                        "MQTT LED thermal limit discovery topic too long");
 #if CONFIG_OTL_CIRCADIAN_ENABLE
     ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.circadian_enabled_state_topic,
                                               sizeof(s_mqtt.circadian_enabled_state_topic),
@@ -1265,6 +1354,7 @@ static void otl_mqtt_event_handler(void *handler_args,
             esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.circadian_coolest_command_topic, 1);
             esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.circadian_warmest_command_topic, 1);
 #endif
+            esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.led_thermal_limit_command_topic, 1);
             esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.verbose_diag_command_topic, 1);
             otl_mqtt_publish_discovery();
             otl_mqtt_publish(s_mqtt.availability_topic, "online", true);

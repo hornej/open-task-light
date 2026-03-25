@@ -616,11 +616,14 @@ static const float MIN_BRIGHTNESS_PERCENT = 5.0f;
 #define OTL_THERMAL_DIM_MAX_BRIGHTNESS_PERCENT   30.0f
 #define OTL_THERMAL_NTC_HOT_CONFIRM_POLLS        2
 #define OTL_NTC_SAMPLE_COUNT                     5
+#define OTL_RUNTIME_LED_THERM_LIMIT_MIN_C        60.0f
+#define OTL_RUNTIME_LED_THERM_LIMIT_MAX_C        110.0f
 
 static volatile bool thermal_ntc_hot = false;
 static volatile bool thermal_chip_hot = false;
 static volatile float thermal_brightness_cap_percent = 100.0f;
 static uint8_t thermal_ntc_hot_confirm_polls = 0;
+static float runtime_led_thermal_limit_c = OTL_THERMAL_NTC_HOT_C;
 // While holding dim-down, allow a deeper range below the normal minimum.
 // HOLD_MIN_BRIGHTNESS_PERCENT is the internal floor used for holds; the mapping
 // below converts that to a physical PWM duty floor (HOLD_MIN_PWM_DUTY_RATIO).
@@ -654,6 +657,7 @@ static inline float clampf(float v, float lo, float hi);
 static esp_err_t otl_runtime_settings_init(void);
 static bool otl_runtime_parse_hhmm_seconds(const char *value, int *seconds_out);
 static void otl_runtime_store_defaults_locked(void);
+static void thermal_update(float ntc_c, float chip_c);
 
 #if CONFIG_OTL_CIRCADIAN_ENABLE
 static void circadian_apply_current_ratio(void)
@@ -1230,6 +1234,7 @@ static void update_outputs(void);
 #define OTL_RUNTIME_KEY_CIRCADIAN_ENABLED "circ_en"
 #define OTL_RUNTIME_KEY_CIRCADIAN_COOL    "circ_cool"
 #define OTL_RUNTIME_KEY_CIRCADIAN_WARM    "circ_warm"
+#define OTL_RUNTIME_KEY_LED_THERM_LIMIT   "led_tmax"
 #define OTL_RUNTIME_KEY_VERBOSE_DIAG      "diag_verbose"
 
 typedef struct {
@@ -1333,6 +1338,7 @@ static void otl_runtime_settings_snapshot_locked(otl_runtime_settings_t *setting
              sizeof(settings->circadian_warmest_time),
              "%s",
              runtime_circadian_warmest_time);
+    settings->led_thermal_limit_c = runtime_led_thermal_limit_c;
     settings->verbose_diagnostics_enabled = runtime_verbose_diagnostics_enabled;
 }
 
@@ -1456,6 +1462,7 @@ static void otl_runtime_store_defaults_locked(void)
              sizeof(runtime_circadian_warmest_time),
              "%s",
              OTL_RUNTIME_DEFAULT_CIRCADIAN_WARMEST_TIME);
+    runtime_led_thermal_limit_c = OTL_THERMAL_NTC_HOT_C;
     runtime_verbose_diagnostics_enabled = false;
 }
 
@@ -1493,6 +1500,27 @@ static esp_err_t otl_runtime_save_u8(const char *key, uint8_t value)
     return err;
 }
 
+static esp_err_t otl_runtime_save_u16(const char *key, uint16_t value)
+{
+    nvs_handle_t handle = 0;
+    esp_err_t err = otl_runtime_nvs_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_open(OTL_RUNTIME_SETTINGS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_set_u16(handle, key, value);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err;
+}
+
 static esp_err_t otl_runtime_save_str(const char *key, const char *value)
 {
     nvs_handle_t handle = 0;
@@ -1518,9 +1546,11 @@ static esp_err_t otl_runtime_settings_init(void)
 {
     bool circadian_enabled = OTL_RUNTIME_DEFAULT_CIRCADIAN_ENABLED;
     bool verbose_enabled = false;
+    float led_thermal_limit_c = OTL_THERMAL_NTC_HOT_C;
     char coolest_time[OTL_RUNTIME_TIME_STR_LEN] = OTL_RUNTIME_DEFAULT_CIRCADIAN_COOLEST_TIME;
     char warmest_time[OTL_RUNTIME_TIME_STR_LEN] = OTL_RUNTIME_DEFAULT_CIRCADIAN_WARMEST_TIME;
     uint8_t stored_u8 = 0;
+    uint16_t stored_u16 = 0;
     char stored_time[OTL_RUNTIME_TIME_STR_LEN] = {0};
     size_t stored_len = 0;
     nvs_handle_t handle = 0;
@@ -1555,6 +1585,13 @@ static esp_err_t otl_runtime_settings_init(void)
         if (nvs_get_u8(handle, OTL_RUNTIME_KEY_VERBOSE_DIAG, &stored_u8) == ESP_OK) {
             verbose_enabled = (stored_u8 != 0);
         }
+        if (nvs_get_u16(handle, OTL_RUNTIME_KEY_LED_THERM_LIMIT, &stored_u16) == ESP_OK) {
+            float stored_limit = (float)stored_u16 / 10.0f;
+            if (stored_limit >= OTL_RUNTIME_LED_THERM_LIMIT_MIN_C &&
+                stored_limit <= OTL_RUNTIME_LED_THERM_LIMIT_MAX_C) {
+                led_thermal_limit_c = stored_limit;
+            }
+        }
         nvs_close(handle);
     } else if (err != ESP_ERR_NVS_NOT_FOUND) {
         return err;
@@ -1567,6 +1604,7 @@ static esp_err_t otl_runtime_settings_init(void)
     snprintf(runtime_circadian_coolest_time, sizeof(runtime_circadian_coolest_time), "%s", coolest_time);
     snprintf(runtime_circadian_warmest_time, sizeof(runtime_circadian_warmest_time), "%s", warmest_time);
 #endif
+    runtime_led_thermal_limit_c = led_thermal_limit_c;
     runtime_verbose_diagnostics_enabled = verbose_enabled;
     otl_state_unlock();
 
@@ -1970,6 +2008,44 @@ esp_err_t otl_runtime_set_circadian_warmest_time(const char *hhmm, otl_change_so
     return ESP_OK;
 }
 
+esp_err_t otl_runtime_set_led_thermal_limit_c(float limit_c, otl_change_source_t source)
+{
+    otl_runtime_settings_t settings = {0};
+    char event_message[OTL_RUNTIME_EVENT_MESSAGE_LEN] = {0};
+    float normalized_limit = roundf(limit_c);
+
+    if (isnan(limit_c) ||
+        normalized_limit < OTL_RUNTIME_LED_THERM_LIMIT_MIN_C ||
+        normalized_limit > OTL_RUNTIME_LED_THERM_LIMIT_MAX_C) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_RETURN_ON_ERROR(otl_runtime_save_u16(OTL_RUNTIME_KEY_LED_THERM_LIMIT,
+                                             (uint16_t)lroundf(normalized_limit * 10.0f)),
+                        "runtime",
+                        "Failed to save LED thermal limit");
+
+    otl_state_lock();
+    if (!otl_runtime_float_changed(runtime_led_thermal_limit_c, normalized_limit, 0.01f)) {
+        otl_state_unlock();
+        return ESP_OK;
+    }
+    runtime_led_thermal_limit_c = normalized_limit;
+    otl_runtime_settings_snapshot_locked(&settings);
+    otl_state_unlock();
+
+    otl_runtime_settings_notify_listeners(&settings, source);
+    thermal_update(telemetry_ntc_temp_c, telemetry_chip_temp_c);
+    otl_telemetry_notify_current();
+
+    snprintf(event_message,
+             sizeof(event_message),
+             "Updated LED thermal limit to %.0fC",
+             normalized_limit);
+    otl_event_emit(OTL_EVENT_LEVEL_INFO, "thermal", event_message);
+    return ESP_OK;
+}
+
 const char *otl_event_level_to_string(otl_event_level_t level)
 {
     switch (level) {
@@ -2064,14 +2140,16 @@ static void thermal_update(float ntc_c, float chip_c)
     bool curr_chip_hot = false;
     bool throttled = false;
     float new_cap = (float)MAX_BRIGHTNESS_PERCENT;
+    float ntc_hot_limit_c = OTL_THERMAL_NTC_HOT_C;
 
     otl_state_lock();
     prev_ntc_hot = thermal_ntc_hot;
     prev_chip_hot = thermal_chip_hot;
+    ntc_hot_limit_c = runtime_led_thermal_limit_c;
 
     if (!isnan(ntc_c)) {
         if (!thermal_ntc_hot) {
-            if (ntc_c >= OTL_THERMAL_NTC_HOT_C) {
+            if (ntc_c >= ntc_hot_limit_c) {
                 if (thermal_ntc_hot_confirm_polls < 255) {
                     thermal_ntc_hot_confirm_polls++;
                 }
@@ -2084,7 +2162,7 @@ static void thermal_update(float ntc_c, float chip_c)
             }
         } else {
             thermal_ntc_hot_confirm_polls = 0;
-            if (ntc_c <= (OTL_THERMAL_NTC_HOT_C - OTL_THERMAL_NTC_HYST_C)) {
+            if (ntc_c <= (ntc_hot_limit_c - OTL_THERMAL_NTC_HYST_C)) {
                 thermal_ntc_hot = false;
             }
         }

@@ -56,6 +56,7 @@ typedef struct {
     bool circadian_enabled;
     char circadian_coolest_time[OTL_RUNTIME_TIME_STR_LEN];
     char circadian_warmest_time[OTL_RUNTIME_TIME_STR_LEN];
+    float led_thermal_limit_c;
     bool verbose_diagnostics_enabled;
 } otl_runtime_settings_t;
 
@@ -99,6 +100,7 @@ esp_err_t otl_runtime_set_verbose_diagnostics(bool enabled, otl_change_source_t 
 esp_err_t otl_runtime_set_circadian_enabled(bool enabled, otl_change_source_t source);
 esp_err_t otl_runtime_set_circadian_coolest_time(const char *hhmm, otl_change_source_t source);
 esp_err_t otl_runtime_set_circadian_warmest_time(const char *hhmm, otl_change_source_t source);
+esp_err_t otl_runtime_set_led_thermal_limit_c(float limit_c, otl_change_source_t source);
 
 void otl_event_get_last(otl_runtime_event_t *event);
 esp_err_t otl_event_add_listener(otl_event_listener_fn listener, void *ctx);
