@@ -768,6 +768,7 @@ static void otl_mqtt_publish_discovery(void)
         "\"payload_off\":\"OFF\","
         "\"state_on\":\"ON\","
         "\"state_off\":\"OFF\","
+        "\"entity_category\":\"config\","
         "\"availability_topic\":\"%s\","
         "\"payload_available\":\"online\","
         "\"payload_not_available\":\"offline\","
@@ -786,7 +787,7 @@ static void otl_mqtt_publish_discovery(void)
 
     payload = otl_mqtt_alloc_printf(
         "{"
-        "\"name\":\"Coolest Time\","
+        "\"name\":\"Firmware Circadian Coolest Time\","
         "\"unique_id\":\"%s_circadian_coolest\","
         "\"command_topic\":\"%s\","
         "\"state_topic\":\"%s\","
@@ -795,6 +796,7 @@ static void otl_mqtt_publish_discovery(void)
         "\"max\":5,"
         "\"mode\":\"text\","
         "\"icon\":\"mdi:clock-outline\","
+        "\"entity_category\":\"config\","
         "\"availability_topic\":\"%s\","
         "\"payload_available\":\"online\","
         "\"payload_not_available\":\"offline\","
@@ -813,7 +815,7 @@ static void otl_mqtt_publish_discovery(void)
 
     payload = otl_mqtt_alloc_printf(
         "{"
-        "\"name\":\"Warmest Time\","
+        "\"name\":\"Firmware Circadian Warmest Time\","
         "\"unique_id\":\"%s_circadian_warmest\","
         "\"command_topic\":\"%s\","
         "\"state_topic\":\"%s\","
@@ -822,6 +824,7 @@ static void otl_mqtt_publish_discovery(void)
         "\"max\":5,"
         "\"mode\":\"text\","
         "\"icon\":\"mdi:clock-outline\","
+        "\"entity_category\":\"config\","
         "\"availability_topic\":\"%s\","
         "\"payload_available\":\"online\","
         "\"payload_not_available\":\"offline\","
