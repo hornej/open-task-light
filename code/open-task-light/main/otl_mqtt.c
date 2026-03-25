@@ -636,7 +636,7 @@ static void otl_mqtt_publish_discovery(void)
 
     payload = otl_mqtt_alloc_printf(
         "{"
-        "\"name\":\"Chip Temperature\","
+        "\"name\":\"ESP32-S3 Internal Temperature\","
         "\"unique_id\":\"%s_chip_temperature\","
         "\"state_topic\":\"%s\","
         "\"device_class\":\"temperature\","

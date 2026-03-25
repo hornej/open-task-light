@@ -2400,20 +2400,23 @@ static temperature_sensor_handle_t chip_temp_handle = NULL;
 
 static void chip_temp_init(void)
 {
-    // Pick a range that covers typical ESP32-S3 junction temperatures while
-    // still allowing the driver to select a valid internal calibration range.
-    temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(20, 100);
+    // Espressif recommends configuring the expected operating range up front so
+    // the driver can choose the lowest-error internal calibration band. This
+    // light uses the reading as an internal ESP32-S3 junction thermal guard, not as an
+    // ambient sensor, so target the expected junction range with headroom above
+    // the 75 C chip hot threshold.
+    temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(20, 80);
 
     esp_err_t err = temperature_sensor_install(&cfg, &chip_temp_handle);
     if (err != ESP_OK) {
-        OTL_LOGW("sensor", "Chip temp sensor install failed: %s", esp_err_to_name(err));
+        OTL_LOGW("sensor", "ESP32-S3 internal temp sensor install failed: %s", esp_err_to_name(err));
         chip_temp_handle = NULL;
         return;
     }
 
     err = temperature_sensor_enable(chip_temp_handle);
     if (err != ESP_OK) {
-        OTL_LOGW("sensor", "Chip temp sensor enable failed: %s", esp_err_to_name(err));
+        OTL_LOGW("sensor", "ESP32-S3 internal temp sensor enable failed: %s", esp_err_to_name(err));
         (void)temperature_sensor_uninstall(chip_temp_handle);
         chip_temp_handle = NULL;
     }
