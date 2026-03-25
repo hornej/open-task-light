@@ -15,6 +15,8 @@
 
 static const char *TAG = "otl_net";
 
+#if CONFIG_OTL_WIFI_ENABLE
+
 #define WIFI_CONNECTED_BIT BIT0
 
 static EventGroupHandle_t s_wifi_event_group;
@@ -160,3 +162,23 @@ bool otl_net_wifi_is_connected(void)
     EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
     return (bits & WIFI_CONNECTED_BIT) != 0;
 }
+
+#else
+
+esp_err_t otl_net_start_wifi(void)
+{
+    return ESP_OK;
+}
+
+esp_err_t otl_net_wait_for_wifi(TickType_t timeout_ticks)
+{
+    (void)timeout_ticks;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+bool otl_net_wifi_is_connected(void)
+{
+    return false;
+}
+
+#endif

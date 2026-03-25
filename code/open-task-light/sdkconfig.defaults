@@ -1,21 +1,9 @@
 # Open Task Light - Default Configuration
 # Copy to sdkconfig or run `idf.py menuconfig` to customize.
-# WiFi credentials must be set via menuconfig (not stored in version control).
+# Connectivity features are disabled by default and can be enabled via menuconfig.
 
 CONFIG_OTL_SERIAL_OUTPUT=y
 CONFIG_OTL_LOG_STATUS=y
 CONFIG_OTL_NONOVERLAP_PWM=y
 CONFIG_OTL_PRESENCE_SENSOR=n
 CONFIG_TOUCH_SUPPRESS_DEPRECATE_WARN=y
-
-# Circadian lighting (requires WiFi credentials via menuconfig)
-CONFIG_OTL_CIRCADIAN_ENABLE=y
-CONFIG_OTL_WIFI_SSID=""
-CONFIG_OTL_WIFI_PASSWORD=""
-CONFIG_OTL_TIMEZONE="UTC0"
-CONFIG_OTL_SNTP_SERVER="pool.ntp.org"
-CONFIG_OTL_CIRCADIAN_UPDATE_INTERVAL_SEC=60
-CONFIG_OTL_CIRCADIAN_COOLEST_TIME="9:00"
-CONFIG_OTL_CIRCADIAN_WARMEST_TIME="19:00"
-CONFIG_OTL_CIRCADIAN_COOL_MIN_PCT=0
-CONFIG_OTL_CIRCADIAN_COOL_MAX_PCT=100

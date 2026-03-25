@@ -94,6 +94,8 @@ static const char *otl_log_localtime(char *buf, size_t buf_len)
 #include "freertos/queue.h"
 #include "esp_intr_alloc.h"
 #include "otl_circadian.h"
+#include "otl_net.h"
+#include "otl_runtime.h"
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0)
 #define OTL_ADC_ATTEN ADC_ATTEN_DB_12
@@ -625,6 +627,8 @@ static uint32_t pwm_hold_current_total_duty = 0;
 #if CONFIG_OTL_SERIAL_OUTPUT && CONFIG_OTL_LOG_PWM_DUTY
 static esp_timer_handle_t pwm_log_timer = NULL;
 #endif
+static SemaphoreHandle_t otl_state_mutex = NULL;
+static bool radar_presence = false;
 
 static inline float clampf(float v, float lo, float hi);
 
@@ -647,16 +651,6 @@ static void otl_set_temp_ratio(float ratio)
     circadian_apply_current_ratio();
 #else
     temp_ratio = ratio;
-#endif
-}
-
-static void otl_adjust_temp_ratio(float delta)
-{
-#if CONFIG_OTL_CIRCADIAN_ENABLE
-    temp_ratio_user_offset += delta;
-    circadian_apply_current_ratio();
-#else
-    temp_ratio = clampf(temp_ratio + delta, 0.0f, 1.0f);
 #endif
 }
 
@@ -884,8 +878,6 @@ static float saved_temp_ratio_offset = 0.0f;
 #else
 static float saved_temp_ratio     = 0.5f;
 #endif
-// Presence as determined from radar UART + OUT pin
-static bool radar_presence        = false;
 // Detection and hysteresis tuning from menuconfig -> Open Task Light -> Radar detection.
 #define RADAR_MOVING_NEAR_MAX_CM      ((uint16_t)CONFIG_OTL_RADAR_MOVING_MAX_DISTANCE_CM)
 #define RADAR_PRESENCE_MAX_DIST_CM    ((uint16_t)CONFIG_OTL_RADAR_STATIONARY_MAX_DISTANCE_CM)
@@ -1204,10 +1196,181 @@ static void ws2812_set_rgb(uint8_t r, uint8_t g, uint8_t b)
 // Forward declaration so occupancy helpers can call it.
 static void update_outputs(void);
 
+#define OTL_MAX_STATE_LISTENERS 4
+
+typedef struct {
+    otl_state_listener_fn listener;
+    void *ctx;
+} otl_state_listener_entry_t;
+
+static otl_state_listener_entry_t otl_state_listeners[OTL_MAX_STATE_LISTENERS];
+
+static void otl_state_lock(void)
+{
+    xSemaphoreTake(otl_state_mutex, portMAX_DELAY);
+}
+
+static void otl_state_unlock(void)
+{
+    xSemaphoreGive(otl_state_mutex);
+}
+
+static bool otl_state_float_changed(float a, float b)
+{
+    return fabsf(a - b) > 0.0005f;
+}
+
+static void otl_state_snapshot_locked(otl_public_state_t *state)
+{
+    if (state == NULL) {
+        return;
+    }
+
+    state->is_on = led_state;
+    state->brightness_percent = brightness_percent;
+    state->temp_ratio = temp_ratio;
+    state->presence = radar_presence;
+}
+
+static void otl_state_notify_listeners(const otl_public_state_t *state,
+                                       otl_change_source_t source)
+{
+    otl_state_listener_entry_t listeners[OTL_MAX_STATE_LISTENERS] = {0};
+    size_t listener_count = 0;
+
+    otl_state_lock();
+    for (size_t i = 0; i < OTL_MAX_STATE_LISTENERS; ++i) {
+        if (otl_state_listeners[i].listener == NULL) {
+            continue;
+        }
+        listeners[listener_count++] = otl_state_listeners[i];
+    }
+    otl_state_unlock();
+
+    for (size_t i = 0; i < listener_count; ++i) {
+        listeners[i].listener(state, source, listeners[i].ctx);
+    }
+}
+
+void otl_state_get_public(otl_public_state_t *state)
+{
+    if (state == NULL) {
+        return;
+    }
+
+    otl_state_lock();
+    otl_state_snapshot_locked(state);
+    otl_state_unlock();
+}
+
+bool otl_state_apply_light_update(const otl_light_update_t *update,
+                                  otl_change_source_t source)
+{
+    bool changed = false;
+    otl_public_state_t state = {0};
+
+    if (update == NULL) {
+        return false;
+    }
+
+    otl_state_lock();
+
+    if (update->set_power && led_state != update->power_on) {
+        changed = true;
+        led_state = update->power_on;
+    }
+
+    if (update->set_brightness) {
+        float new_brightness = clampf(update->brightness_percent,
+                                      HOLD_MIN_BRIGHTNESS_PERCENT,
+                                      (float)MAX_BRIGHTNESS_PERCENT);
+        if (otl_state_float_changed(brightness_percent, new_brightness)) {
+            changed = true;
+            brightness_percent = new_brightness;
+        }
+        if (update->force_on_with_brightness && !led_state) {
+            changed = true;
+            led_state = true;
+        }
+    }
+
+    if (update->set_temp_ratio) {
+        float prev_temp_ratio = temp_ratio;
+        otl_set_temp_ratio(update->temp_ratio);
+        if (otl_state_float_changed(prev_temp_ratio, temp_ratio)) {
+            changed = true;
+        }
+    }
+
+    if (!changed) {
+        otl_state_unlock();
+        return false;
+    }
+
+    update_outputs();
+    otl_state_snapshot_locked(&state);
+    otl_state_unlock();
+    otl_state_notify_listeners(&state, source);
+    return true;
+}
+
+bool otl_state_set_presence(bool presence, otl_change_source_t source)
+{
+    bool changed = false;
+    otl_public_state_t state = {0};
+
+    otl_state_lock();
+    if (radar_presence != presence) {
+        radar_presence = presence;
+        changed = true;
+        otl_state_snapshot_locked(&state);
+    }
+    otl_state_unlock();
+
+    if (changed) {
+        otl_state_notify_listeners(&state, source);
+    }
+
+    return changed;
+}
+
+esp_err_t otl_state_add_listener(otl_state_listener_fn listener, void *ctx)
+{
+    if (listener == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    otl_state_lock();
+    for (size_t i = 0; i < OTL_MAX_STATE_LISTENERS; ++i) {
+        if (otl_state_listeners[i].listener != NULL) {
+            continue;
+        }
+        otl_state_listeners[i].listener = listener;
+        otl_state_listeners[i].ctx = ctx;
+        otl_state_unlock();
+        return ESP_OK;
+    }
+    otl_state_unlock();
+    return ESP_ERR_NO_MEM;
+}
+
+void otl_state_notify_current(otl_change_source_t source)
+{
+    otl_public_state_t state = {0};
+    otl_state_get_public(&state);
+    otl_state_notify_listeners(&state, source);
+}
+
 static void thermal_update(float ntc_c, float chip_c)
 {
-    bool prev_ntc_hot = thermal_ntc_hot;
-    bool prev_chip_hot = thermal_chip_hot;
+    bool prev_ntc_hot = false;
+    bool prev_chip_hot = false;
+    bool throttled = false;
+    float new_cap = (float)MAX_BRIGHTNESS_PERCENT;
+
+    otl_state_lock();
+    prev_ntc_hot = thermal_ntc_hot;
+    prev_chip_hot = thermal_chip_hot;
 
     if (!isnan(ntc_c)) {
         if (!thermal_ntc_hot) {
@@ -1244,8 +1407,8 @@ static void thermal_update(float ntc_c, float chip_c)
         }
     }
 
-    bool throttled = thermal_ntc_hot || thermal_chip_hot;
-    float new_cap = throttled ? OTL_THERMAL_DIM_MAX_BRIGHTNESS_PERCENT : (float)MAX_BRIGHTNESS_PERCENT;
+    throttled = thermal_ntc_hot || thermal_chip_hot;
+    new_cap = throttled ? OTL_THERMAL_DIM_MAX_BRIGHTNESS_PERCENT : (float)MAX_BRIGHTNESS_PERCENT;
 
     if (fabsf(new_cap - (float)thermal_brightness_cap_percent) > 0.01f) {
         thermal_brightness_cap_percent = new_cap;
@@ -1253,6 +1416,7 @@ static void thermal_update(float ntc_c, float chip_c)
             update_outputs();
         }
     }
+    otl_state_unlock();
 
     if ((prev_ntc_hot != thermal_ntc_hot) || (prev_chip_hot != thermal_chip_hot)) {
         OTL_LOGW("thermal",
@@ -1269,11 +1433,24 @@ static void thermal_update(float ntc_c, float chip_c)
 #if CONFIG_OTL_CIRCADIAN_ENABLE
 static void otl_circadian_apply_cb(float base_ratio, void *ctx)
 {
+    bool changed = false;
+    otl_public_state_t state = {0};
+
     (void)ctx;
+    otl_state_lock();
+    float prev_temp_ratio = temp_ratio;
     circadian_base_ratio = base_ratio;
     circadian_apply_current_ratio();
-    if (led_state) {
+    changed = otl_state_float_changed(prev_temp_ratio, temp_ratio);
+    if (led_state && changed) {
         update_outputs();
+    }
+    if (changed) {
+        otl_state_snapshot_locked(&state);
+    }
+    otl_state_unlock();
+    if (changed) {
+        otl_state_notify_listeners(&state, OTL_CHANGE_SOURCE_CIRCADIAN);
     }
 }
 #endif
@@ -1289,14 +1466,20 @@ static void fade_brightness(int start, int end, int step, int delay_ms)
 
     if (start < end) {
         for (int b = start; b <= end; b += step) {
-            brightness_percent = b;
-            update_outputs();
+            otl_state_apply_light_update(&(otl_light_update_t) {
+                .set_brightness = true,
+                .force_on_with_brightness = true,
+                .brightness_percent = (float)b,
+            }, OTL_CHANGE_SOURCE_OCCUPANCY);
             vTaskDelay(pdMS_TO_TICKS(delay_ms));
         }
     } else {
         for (int b = start; b >= end; b -= step) {
-            brightness_percent = b;
-            update_outputs();
+            otl_state_apply_light_update(&(otl_light_update_t) {
+                .set_brightness = true,
+                .force_on_with_brightness = true,
+                .brightness_percent = (float)b,
+            }, OTL_CHANGE_SOURCE_OCCUPANCY);
             vTaskDelay(pdMS_TO_TICKS(delay_ms));
         }
     }
@@ -1304,41 +1487,52 @@ static void fade_brightness(int start, int end, int step, int delay_ms)
 
 static void handle_occupancy_lost(void)
 {
+    int fade_start = 0;
+
+    otl_state_lock();
     radar_occupied = false;
 
     // Only fade out if the light is currently on and
     // we haven't already faded it out.
     if (!led_state || occupancy_faded_out) {
+        otl_state_unlock();
         return;
     }
 
     saved_led_state  = led_state;
     saved_brightness = (int)lroundf(fminf(brightness_percent, (float)MAX_BRIGHTNESS_PERCENT));
+    fade_start = (int)lroundf(brightness_percent);
 #if CONFIG_OTL_CIRCADIAN_ENABLE
     saved_temp_ratio_offset = temp_ratio_user_offset;
 #else
     saved_temp_ratio = temp_ratio;
 #endif
+    otl_state_unlock();
 
     // Fade down to 0% brightness, then turn off.
-    fade_brightness((int)lroundf(brightness_percent), 0, BRIGHT_STEP, 15);
-    led_state = false;
-    update_outputs();
-
+    fade_brightness(fade_start, 0, BRIGHT_STEP, 15);
     occupancy_faded_out = true;
+    otl_state_apply_light_update(&(otl_light_update_t) {
+        .set_power = true,
+        .power_on = false,
+    }, OTL_CHANGE_SOURCE_OCCUPANCY);
 }
 
 static void handle_occupancy_gained(void)
 {
+    int fade_end = 0;
+
+    otl_state_lock();
     radar_occupied = true;
 
     // Only fade back in if we previously faded out the light
     // and the saved state indicates it should be on.
     if (!occupancy_faded_out || !saved_led_state) {
+        otl_state_unlock();
         return;
     }
 
-    led_state  = true;
+    fade_end = saved_brightness;
 #if CONFIG_OTL_CIRCADIAN_ENABLE
     temp_ratio_user_offset = saved_temp_ratio_offset;
     circadian_apply_current_ratio();
@@ -1348,10 +1542,14 @@ static void handle_occupancy_gained(void)
 
     // Fade from 0 up to the saved brightness.
     brightness_percent = 0;
+    led_state = true;
+    otl_public_state_t state = {0};
     update_outputs();
-    fade_brightness(0, saved_brightness, BRIGHT_STEP, 15);
-
     occupancy_faded_out = false;
+    otl_state_snapshot_locked(&state);
+    otl_state_unlock();
+    otl_state_notify_listeners(&state, OTL_CHANGE_SOURCE_OCCUPANCY);
+    fade_brightness(0, fade_end, BRIGHT_STEP, 15);
 }
 #endif
 
@@ -1728,19 +1926,25 @@ static void touch_task(void *arg)
         bool power_pressed_edge = power_pressed && !prev_pressed[0];
 
         if (power_pressed_edge) {
+            otl_public_state_t state = {0};
             power_press_ms = now;
+            otl_state_get_public(&state);
 
-            if (!led_state) {
-                led_state = true;
+            if (!state.is_on) {
                 neopixel_enabled = false;
                 power_arm_neopixel = true;
-                update_outputs();
+                otl_state_apply_light_update(&(otl_light_update_t) {
+                    .set_power = true,
+                    .power_on = true,
+                }, OTL_CHANGE_SOURCE_TOUCH);
                 OTL_LOG_TOUCHI("LED turned: ON");
             } else {
-                led_state = false;
                 neopixel_enabled = false;
                 power_arm_neopixel = false;
-                update_outputs();
+                otl_state_apply_light_update(&(otl_light_update_t) {
+                    .set_power = true,
+                    .power_on = false,
+                }, OTL_CHANGE_SOURCE_TOUCH);
                 OTL_LOG_TOUCHI("LED turned: OFF");
             }
         }
@@ -1748,7 +1952,9 @@ static void touch_task(void *arg)
         if (power_pressed && power_arm_neopixel && !neopixel_enabled &&
             (now - power_press_ms) >= POWER_HOLD_NEOPIXEL_MS) {
             neopixel_enabled = true;
+            otl_state_lock();
             update_outputs();
+            otl_state_unlock();
             OTL_LOG_TOUCHI("NeoPixel enabled");
         }
 
@@ -1758,8 +1964,9 @@ static void touch_task(void *arg)
 
         // --- Brightness UP ---
         if (pad_intr & (1UL << touch_pads[1])) {
-            led_state = true; // Ensure LED is ON when changing brightness
-            
+            otl_public_state_t state = {0};
+            otl_state_get_public(&state);
+
             // First press or double-tap
             if (!button_being_held[1]) {
                 button_being_held[1] = true;
@@ -1767,36 +1974,42 @@ static void touch_task(void *arg)
                 last_repeat_time[1] = now;
 
                 if (now - tap_last_ms[1] < DOUBLE_TAP_MS) {
-                    brightness_percent = MAX_BRIGHTNESS_PERCENT;
-                    update_outputs();
+                    otl_state_apply_light_update(&(otl_light_update_t) {
+                        .set_power = true,
+                        .power_on = true,
+                        .set_brightness = true,
+                        .force_on_with_brightness = true,
+                        .brightness_percent = (float)MAX_BRIGHTNESS_PERCENT,
+                    }, OTL_CHANGE_SOURCE_TOUCH);
                     OTL_LOG_TOUCHI("Brightness set to MAX (%d%%)", MAX_BRIGHTNESS_PERCENT);
                     tap_last_ms[1] = now;
                 } else {
-                    float prev_brightness = brightness_percent;
-                    brightness_percent = fminf(brightness_percent + (float)BRIGHT_STEP, (float)MAX_BRIGHTNESS_PERCENT);
-                    if (brightness_percent != prev_brightness) {
-                        update_outputs();
-                        OTL_LOG_TOUCHI("Brightness increased to: %d%%", (int)lroundf(brightness_percent));
+                    float new_brightness = fminf(state.brightness_percent + (float)BRIGHT_STEP,
+                                                 (float)MAX_BRIGHTNESS_PERCENT);
+                    if (new_brightness != state.brightness_percent) {
+                        otl_state_apply_light_update(&(otl_light_update_t) {
+                            .set_power = true,
+                            .power_on = true,
+                            .set_brightness = true,
+                            .force_on_with_brightness = true,
+                            .brightness_percent = new_brightness,
+                        }, OTL_CHANGE_SOURCE_TOUCH);
+                        OTL_LOG_TOUCHI("Brightness increased to: %d%%", (int)lroundf(new_brightness));
                     }
                     tap_last_ms[1] = now;
                 }
-                  
             }
         }
 
         // --- Brightness DOWN ---
         if (pad_intr & (1UL << touch_pads[2])) {
+            otl_public_state_t state = {0};
             // If the light is currently OFF, start from the normal minimum so a
             // dim-down press never "flashes" on at a previously-saved high
             // brightness.
-            bool was_off = !led_state;
-            if (was_off) {
-                brightness_percent = MIN_BRIGHTNESS_PERCENT;
-            }
-            led_state = true;
-            if (was_off) {
-                update_outputs();
-            }
+            otl_state_get_public(&state);
+            bool was_off = !state.is_on;
+            float current_brightness = was_off ? MIN_BRIGHTNESS_PERCENT : state.brightness_percent;
              
             if (!button_being_held[2]) {
                 button_being_held[2] = true;
@@ -1806,45 +2019,60 @@ static void touch_task(void *arg)
                 // double-tap minimum) on the same press-and-hold. If we started
                 // above MIN, or we just turned on from OFF, clamp this hold at
                 // MIN until the user releases and holds again.
-                dim_down_hold_clamp_at_min = was_off || (brightness_percent > MIN_BRIGHTNESS_PERCENT);
+                dim_down_hold_clamp_at_min = was_off || (current_brightness > MIN_BRIGHTNESS_PERCENT);
 
-                if ((brightness_percent >= MIN_BRIGHTNESS_PERCENT) && (now - tap_last_ms[2] < DOUBLE_TAP_MS)) {
-                    brightness_percent = MIN_BRIGHTNESS_PERCENT;
-                    update_outputs();
+                if ((current_brightness >= MIN_BRIGHTNESS_PERCENT) && (now - tap_last_ms[2] < DOUBLE_TAP_MS)) {
+                    otl_state_apply_light_update(&(otl_light_update_t) {
+                        .set_power = true,
+                        .power_on = true,
+                        .set_brightness = true,
+                        .force_on_with_brightness = true,
+                        .brightness_percent = MIN_BRIGHTNESS_PERCENT,
+                    }, OTL_CHANGE_SOURCE_TOUCH);
                     OTL_LOG_TOUCHI("Brightness set to MIN (%d%%)", (int)lroundf(MIN_BRIGHTNESS_PERCENT));
                     tap_last_ms[2] = now;
                 } else {
-                    float prev_brightness = brightness_percent;
-                    float min_limit = (brightness_percent > MIN_BRIGHTNESS_PERCENT) ? MIN_BRIGHTNESS_PERCENT : HOLD_MIN_BRIGHTNESS_PERCENT;
-                    brightness_percent = fmaxf(brightness_percent - (float)BRIGHT_STEP, min_limit);
-                    if (brightness_percent != prev_brightness) {
-                        update_outputs();
-                        OTL_LOG_TOUCHI("Brightness decreased to: %d%%", (int)lroundf(brightness_percent));
+                    float min_limit = (current_brightness > MIN_BRIGHTNESS_PERCENT) ? MIN_BRIGHTNESS_PERCENT : HOLD_MIN_BRIGHTNESS_PERCENT;
+                    float new_brightness = fmaxf(current_brightness - (float)BRIGHT_STEP, min_limit);
+                    if (new_brightness != current_brightness) {
+                        otl_state_apply_light_update(&(otl_light_update_t) {
+                            .set_power = true,
+                            .power_on = true,
+                            .set_brightness = true,
+                            .force_on_with_brightness = true,
+                            .brightness_percent = new_brightness,
+                        }, OTL_CHANGE_SOURCE_TOUCH);
+                        OTL_LOG_TOUCHI("Brightness decreased to: %d%%", (int)lroundf(new_brightness));
                     }
                     tap_last_ms[2] = now;
                 }
-                  
             }
         }
 
         // --- Temp UP (cooler) ---
-        if ((pad_intr & (1UL << touch_pads[3])) && led_state) {
-            if (!button_being_held[3]) {
+        if (pad_intr & (1UL << touch_pads[3])) {
+            otl_public_state_t state = {0};
+            otl_state_get_public(&state);
+            if (state.is_on && !button_being_held[3]) {
                 button_being_held[3] = true;
                 button_press_time[3] = now;
                 last_repeat_time[3] = now;
                  
                 if (now - tap_last_ms[3] < DOUBLE_TAP_MS) {
-                    otl_set_temp_ratio(1.0f);
-                    update_outputs();
+                    otl_state_apply_light_update(&(otl_light_update_t) {
+                        .set_temp_ratio = true,
+                        .temp_ratio = 1.0f,
+                    }, OTL_CHANGE_SOURCE_TOUCH);
                     OTL_LOG_TOUCHI("Temperature set to MAX COOL (1.0)");
                 } else {
-                    float prev_temp = temp_ratio;
-                    otl_adjust_temp_ratio(TEMP_STEP);
-                    if (temp_ratio != prev_temp) {
-                        update_outputs();
+                    float new_temp = clampf(state.temp_ratio + TEMP_STEP, 0.0f, 1.0f);
+                    if (new_temp != state.temp_ratio) {
+                        otl_state_apply_light_update(&(otl_light_update_t) {
+                            .set_temp_ratio = true,
+                            .temp_ratio = new_temp,
+                        }, OTL_CHANGE_SOURCE_TOUCH);
                         OTL_LOG_TOUCHI("White temp increase: %.2f | Warm temp decrease: %.2f", 
-                                temp_ratio, 1.0f - temp_ratio);
+                                new_temp, 1.0f - new_temp);
                     }
                 }
                 tap_last_ms[3] = now;
@@ -1852,29 +2080,34 @@ static void touch_task(void *arg)
         }
 
         // --- Temp DOWN (warmer) ---
-        if ((pad_intr & (1UL << touch_pads[4])) && led_state) {
-            if (!button_being_held[4]) {
+        if (pad_intr & (1UL << touch_pads[4])) {
+            otl_public_state_t state = {0};
+            otl_state_get_public(&state);
+            if (state.is_on && !button_being_held[4]) {
                 button_being_held[4] = true;
                 button_press_time[4] = now;
                 last_repeat_time[4] = now;
                  
                 if (now - tap_last_ms[4] < DOUBLE_TAP_MS) {
-                    otl_set_temp_ratio(0.0f);
-                    update_outputs();
+                    otl_state_apply_light_update(&(otl_light_update_t) {
+                        .set_temp_ratio = true,
+                        .temp_ratio = 0.0f,
+                    }, OTL_CHANGE_SOURCE_TOUCH);
                     OTL_LOG_TOUCHI("Temperature set to MAX WARM (0.0)");
                 } else {
-                    float prev_temp = temp_ratio;
-                    otl_adjust_temp_ratio(-TEMP_STEP);
-                    if (temp_ratio != prev_temp) {
-                        update_outputs();
+                    float new_temp = clampf(state.temp_ratio - TEMP_STEP, 0.0f, 1.0f);
+                    if (new_temp != state.temp_ratio) {
+                        otl_state_apply_light_update(&(otl_light_update_t) {
+                            .set_temp_ratio = true,
+                            .temp_ratio = new_temp,
+                        }, OTL_CHANGE_SOURCE_TOUCH);
                         OTL_LOG_TOUCHI("Cool temp decrease: %.2f | Warm temp increase: %.2f", 
-                                temp_ratio, 1.0f - temp_ratio);
+                                new_temp, 1.0f - new_temp);
                     }
                 }
                 tap_last_ms[4] = now;
             }
         }
-        
         // Handle button hold and repeat - this is independent of queue events
         // to ensure consistent timing
         now = esp_timer_get_time() / 1000; // Update current time
@@ -1910,6 +2143,8 @@ static void touch_task(void *arg)
                         want_hold_stepper = true;
                         uint32_t dt_ms = now - last_repeat_time[i];
                         last_repeat_time[i] = now;
+                        otl_public_state_t state = {0};
+                        otl_state_get_public(&state);
 
                         float effective_repeat_ms = base_repeat_ms;
                         float dist_to_limit = 0.0f;
@@ -1918,9 +2153,9 @@ static void touch_task(void *arg)
                             min_brightness_limit = dim_down_hold_clamp_at_min ? MIN_BRIGHTNESS_PERCENT : HOLD_MIN_BRIGHTNESS_PERCENT;
                         }
                         if (i == 1) {
-                            dist_to_limit = (float)MAX_BRIGHTNESS_PERCENT - brightness_percent;
+                            dist_to_limit = (float)MAX_BRIGHTNESS_PERCENT - state.brightness_percent;
                         } else {
-                            dist_to_limit = brightness_percent - min_brightness_limit;
+                            dist_to_limit = state.brightness_percent - min_brightness_limit;
                             if (dist_to_limit < 0.0f) {
                                 dist_to_limit = 0.0f;
                             }
@@ -1930,7 +2165,7 @@ static void touch_task(void *arg)
                             effective_repeat_ms = end_min_ms;
                         }
 
-                        float deep_min_ms = brightness_deep_dim_min_repeat_ms(brightness_percent);
+                        float deep_min_ms = brightness_deep_dim_min_repeat_ms(state.brightness_percent);
                         if (deep_min_ms > effective_repeat_ms) {
                             effective_repeat_ms = deep_min_ms;
                         }
@@ -1941,16 +2176,21 @@ static void touch_task(void *arg)
                             break;
                         }
 
-                        float prev_brightness = brightness_percent;
+                        float new_brightness = state.brightness_percent;
                         if (i == 1) {
-                            brightness_percent = fminf(brightness_percent + delta_percent, (float)MAX_BRIGHTNESS_PERCENT);
+                            new_brightness = fminf(state.brightness_percent + delta_percent, (float)MAX_BRIGHTNESS_PERCENT);
                         } else {
-                            brightness_percent = fmaxf(brightness_percent - delta_percent, min_brightness_limit);
+                            new_brightness = fmaxf(state.brightness_percent - delta_percent, min_brightness_limit);
                         }
 
-                        if (brightness_percent != prev_brightness) {
-                            led_state = true;
-                            update_outputs();
+                        if (new_brightness != state.brightness_percent) {
+                            otl_state_apply_light_update(&(otl_light_update_t) {
+                                .set_power = true,
+                                .power_on = true,
+                                .set_brightness = true,
+                                .force_on_with_brightness = true,
+                                .brightness_percent = new_brightness,
+                            }, OTL_CHANGE_SOURCE_TOUCH);
                         }
                         break;
                     }
@@ -1958,7 +2198,9 @@ static void touch_task(void *arg)
                     case 3: // Temp UP
                     case 4: // Temp DOWN
                     {
-                        if (!led_state) {
+                        otl_public_state_t state = {0};
+                        otl_state_get_public(&state);
+                        if (!state.is_on) {
                             break;
                         }
 
@@ -1971,7 +2213,7 @@ static void touch_task(void *arg)
                             effective_repeat_ms = (float)dt_ms;
                         }
 
-                        float dist_to_limit = (i == 3) ? (1.0f - temp_ratio) : temp_ratio;
+                        float dist_to_limit = (i == 3) ? (1.0f - state.temp_ratio) : state.temp_ratio;
                         if (dist_to_limit < TEMP_HOLD_VERY_SLOW_ZONE_RATIO) {
                             if (effective_repeat_ms < TEMP_HOLD_MIN_REPEAT_MS_VERY_SLOW) {
                                 effective_repeat_ms = (float)TEMP_HOLD_MIN_REPEAT_MS_VERY_SLOW;
@@ -1988,11 +2230,12 @@ static void touch_task(void *arg)
                             break;
                         }
 
-                        float prev_temp = temp_ratio;
-                        otl_adjust_temp_ratio((i == 3) ? delta_ratio : -delta_ratio);
-
-                        if (temp_ratio != prev_temp) {
-                            update_outputs();
+                        float new_temp = clampf(state.temp_ratio + ((i == 3) ? delta_ratio : -delta_ratio), 0.0f, 1.0f);
+                        if (new_temp != state.temp_ratio) {
+                            otl_state_apply_light_update(&(otl_light_update_t) {
+                                .set_temp_ratio = true,
+                                .temp_ratio = new_temp,
+                            }, OTL_CHANGE_SOURCE_TOUCH);
                         }
                         break;
                     }
@@ -2022,14 +2265,18 @@ static void touch_task(void *arg)
 #if CONFIG_OTL_PRESENCE_SENSOR
 static void radar_task(void *arg)
 {
+    otl_public_state_t state = {0};
     // Configure initial state from pin level + last_sample on both candidate OUT pins
     int level15 = gpio_get_level(RADAR_OUT_GPIO);
     int level14 = gpio_get_level(RADAR_OUT_GPIO_ALT);
     bool out_state = (level14 == 1) || (level15 == 1);
     bool moving = radar_last_sample.valid && (radar_last_sample.targetType & 0x01);
     bool stationary = radar_last_sample.valid && (radar_last_sample.targetType & 0x02);
-    radar_presence = out_state || moving || stationary;
-    radar_occupied = radar_presence;
+    bool initial_presence = out_state || moving || stationary;
+    otl_state_lock();
+    radar_occupied = initial_presence;
+    otl_state_unlock();
+    otl_state_set_presence(initial_presence, OTL_CHANGE_SOURCE_OCCUPANCY);
 
     uint32_t last_log_ms      = 0;
     uint32_t last_presence_ms = esp_timer_get_time() / 1000;
@@ -2037,6 +2284,7 @@ static void radar_task(void *arg)
     bool     presence_candidate_active   = false;
 
     while (1) {
+        bool currently_occupied = false;
         // 1) Read any pending UART data and update radar_last_sample
         uint8_t buf[64];
         int len = uart_read_bytes(RADAR_UART_NUM, buf, sizeof(buf), 0);
@@ -2090,8 +2338,9 @@ static void radar_task(void *arg)
         // Log periodically so we can see what the radar is doing,
         // even if presence does not change.
         if (now_ms - last_log_ms > 2000) {
+            otl_state_get_public(&state);
             OTL_LOG_RADARI("presence=%s OUT14=%d OUT15=%d moving=%d stationary=%d movDist=%ucm statDist=%ucm",
-                           (radar_presence ? "ON" : "OFF"),
+                           (state.presence ? "ON" : "OFF"),
                            out14_level, out15_level,
                            moving ? 1 : 0, stationary ? 1 : 0,
                            (unsigned)radar_last_sample.movingDist,
@@ -2104,17 +2353,20 @@ static void radar_task(void *arg)
         //    RADAR_PRESENCE_ON_DELAY_MS
         //  - turn OFF only after absence has been continuous for
         //    RADAR_ABSENCE_TIMEOUT_MS
-        if (new_presence && !radar_occupied &&
+        otl_state_get_public(&state);
+        otl_state_lock();
+        currently_occupied = radar_occupied;
+        otl_state_unlock();
+
+        if (new_presence && !currently_occupied &&
             presence_candidate_active &&
             (now_ms - presence_candidate_since_ms) > RADAR_PRESENCE_ON_DELAY_MS) {
-            radar_presence = true;
+            otl_state_set_presence(true, OTL_CHANGE_SOURCE_OCCUPANCY);
             handle_occupancy_gained();
-            radar_occupied = true;
-        } else if (!new_presence && radar_occupied &&
+        } else if (!new_presence && currently_occupied &&
                    (now_ms - last_presence_ms) > RADAR_ABSENCE_TIMEOUT_MS) {
-            radar_presence = false;
+            otl_state_set_presence(false, OTL_CHANGE_SOURCE_OCCUPANCY);
             handle_occupancy_lost();
-            radar_occupied = false;
         }
 
         TickType_t delay_ticks = pdMS_TO_TICKS(RADAR_TASK_LOOP_INTERVAL_MS);
@@ -2144,16 +2396,18 @@ static void sensor_task(void *arg)
 #if CONFIG_OTL_SERIAL_OUTPUT && (CONFIG_OTL_LOG_STATUS || CONFIG_OTL_SENSOR_DEBUG)
         log_elapsed_ms += THERMAL_POLL_INTERVAL_MS;
         if (log_elapsed_ms >= SENSOR_READ_INTERVAL_MS) {
+            otl_public_state_t state = {0};
             log_elapsed_ms = 0;
             float lux = read_als_lux();
+            otl_state_get_public(&state);
 #if CONFIG_OTL_LOG_STATUS
-            const char *light_state = led_state ? "ON" : "OFF";
-            float temp_cool_ratio = temp_ratio;
-            float temp_warm_ratio = 1.0f - temp_ratio;
+            const char *light_state = state.is_on ? "ON" : "OFF";
+            float temp_cool_ratio = state.temp_ratio;
+            float temp_warm_ratio = 1.0f - state.temp_ratio;
             if (!isnan(chip_temp)) {
                 OTL_LOG_STATUSI("Light %s | B %.0f%% | Temp %.2f (cool %.0f%%/warm %.0f%%) | Ambient %.0f lux | NTC %.1f °C | Chip %.1f °C",
                                 light_state,
-                                brightness_percent,
+                                state.brightness_percent,
                                 temp_cool_ratio,
                                 temp_cool_ratio * 100.0f,
                                 temp_warm_ratio * 100.0f,
@@ -2163,7 +2417,7 @@ static void sensor_task(void *arg)
             } else {
                 OTL_LOG_STATUSI("Light %s | B %.0f%% | Temp %.2f (cool %.0f%%/warm %.0f%%) | Ambient %.0f lux | NTC %.1f °C",
                                 light_state,
-                                brightness_percent,
+                                state.brightness_percent,
                                 temp_cool_ratio,
                                 temp_cool_ratio * 100.0f,
                                 temp_warm_ratio * 100.0f,
@@ -2248,6 +2502,11 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_timer_create(&pwm_log_timer_args, &pwm_log_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(pwm_log_timer, (uint64_t)CONFIG_OTL_PWM_LOG_INTERVAL_MS * 1000ULL));
 #endif
+
+    otl_state_mutex = xSemaphoreCreateMutex();
+    if (otl_state_mutex == NULL) {
+        abort();
+    }
 
     // 2. WS2812 via RMT LED-Strip driver
     led_strip_config_t strip_config = {
@@ -2351,6 +2610,13 @@ void app_main(void)
     chip_temp_init();
     thermal_brightness_cap_percent = (float)MAX_BRIGHTNESS_PERCENT;
 
+#if CONFIG_OTL_WIFI_ENABLE
+    esp_err_t wifi_err = otl_net_start_wifi();
+    if (wifi_err != ESP_OK) {
+        OTL_LOGE("wifi", "Start failed: %s", esp_err_to_name(wifi_err));
+    }
+#endif
+
 #if CONFIG_OTL_CIRCADIAN_ENABLE
     esp_err_t circadian_err = otl_circadian_start(otl_circadian_apply_cb, NULL);
     if (circadian_err != ESP_OK) {
@@ -2369,7 +2635,9 @@ void app_main(void)
 #endif
 
     // Initial output state
+    otl_state_lock();
     update_outputs();
+    otl_state_unlock();
     
     OTL_LOGI("main", "Open Task Light initialization complete");
 }
