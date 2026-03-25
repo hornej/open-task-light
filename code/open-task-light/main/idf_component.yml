@@ -1,6 +1,10 @@
 ## IDF Component Manager Manifest File
 dependencies:
   espressif/led_strip: "^3.0.3"
+  espressif/mqtt:
+    version: "*"
+    rules:
+      - if: "$CONFIG{OTL_HA_MQTT_DEP_ENABLE} == 1"
   ## Required IDF version
   idf:
     version: "6.0.0"

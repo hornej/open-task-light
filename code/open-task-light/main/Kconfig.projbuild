@@ -107,6 +107,11 @@ config OTL_HA_MQTT_ENABLE
         Publishes Home Assistant MQTT discovery, state, and command topics for
         native integration without ESPHome.
 
+config OTL_HA_MQTT_DEP_ENABLE
+    int
+    default 1 if OTL_HA_MQTT_ENABLE
+    default 0
+
 menu "Home Assistant MQTT settings"
     depends on OTL_HA_MQTT_ENABLE
 

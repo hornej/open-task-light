@@ -13,9 +13,9 @@
 #include "freertos/event_groups.h"
 #include "nvs_flash.h"
 
-static const char *TAG = "otl_net";
-
 #if CONFIG_OTL_WIFI_ENABLE
+
+static const char *TAG = "otl_net";
 
 #define WIFI_CONNECTED_BIT BIT0
 
