@@ -16,6 +16,8 @@ set(otl_main_requires
     esp_driver_touch_sens
     esp_driver_tsens
     esp_driver_uart
+    nvs_flash
+    esp_wifi
     otl_circadian
     otl_net
 )

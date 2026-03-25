@@ -380,6 +380,7 @@ static esp_err_t otl_homekit_init_accessory(void)
     otl_state_notify_current(OTL_CHANGE_SOURCE_SYSTEM);
     otl_homekit_log_pairing_payload();
     ESP_LOGI(TAG, "HomeKit integration started");
+    otl_event_emit(OTL_EVENT_LEVEL_INFO, "homekit", "HomeKit integration started");
     return ESP_OK;
 }
 

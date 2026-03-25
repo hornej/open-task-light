@@ -21,6 +21,8 @@ static bool s_started;
 
 static otl_circadian_apply_fn_t s_apply_cb;
 static void *s_apply_ctx;
+static otl_circadian_schedule_getter_fn_t s_schedule_getter;
+static void *s_schedule_ctx;
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -118,6 +120,26 @@ static int parse_config_time_or_fallback(const char *config_value,
     return fallback_seconds;
 }
 
+static void circadian_get_schedule(otl_circadian_schedule_t *schedule)
+{
+    if (schedule == NULL) {
+        return;
+    }
+
+    if (s_schedule_getter != NULL && s_schedule_getter(schedule, s_schedule_ctx)) {
+        return;
+    }
+
+    schedule->coolest_seconds = parse_config_time_or_fallback(
+        CONFIG_OTL_CIRCADIAN_COOLEST_TIME,
+        11 * 3600,
+        "CONFIG_OTL_CIRCADIAN_COOLEST_TIME");
+    schedule->warmest_seconds = parse_config_time_or_fallback(
+        CONFIG_OTL_CIRCADIAN_WARMEST_TIME,
+        23 * 3600,
+        "CONFIG_OTL_CIRCADIAN_WARMEST_TIME");
+}
+
 static float circadian_compute_cool_ratio(const struct tm *local_time,
                                           int coolest_sec,
                                           int warmest_sec)
@@ -199,24 +221,19 @@ static void circadian_task(void *arg)
     }
     log_time_sync_success();
 
-    const int coolest_sec = parse_config_time_or_fallback(
-        CONFIG_OTL_CIRCADIAN_COOLEST_TIME,
-        11 * 3600,
-        "CONFIG_OTL_CIRCADIAN_COOLEST_TIME");
-    const int warmest_sec = parse_config_time_or_fallback(
-        CONFIG_OTL_CIRCADIAN_WARMEST_TIME,
-        23 * 3600,
-        "CONFIG_OTL_CIRCADIAN_WARMEST_TIME");
-
     float last_ratio = -1.0f;
     while (1) {
+        otl_circadian_schedule_t schedule = {0};
         time_t now = 0;
         struct tm timeinfo = {0};
         time(&now);
         localtime_r(&now, &timeinfo);
+        circadian_get_schedule(&schedule);
 
         if (timeinfo.tm_year >= (2020 - 1900)) {
-            float ratio = circadian_compute_cool_ratio(&timeinfo, coolest_sec, warmest_sec);
+            float ratio = circadian_compute_cool_ratio(&timeinfo,
+                                                       schedule.coolest_seconds,
+                                                       schedule.warmest_seconds);
             if (last_ratio < 0.0f || fabsf(ratio - last_ratio) >= 0.0005f) {
                 last_ratio = ratio;
                 if (s_apply_cb != NULL) {
@@ -229,7 +246,10 @@ static void circadian_task(void *arg)
     }
 }
 
-esp_err_t otl_circadian_start(otl_circadian_apply_fn_t apply_cb, void *apply_ctx)
+esp_err_t otl_circadian_start(otl_circadian_apply_fn_t apply_cb,
+                              void *apply_ctx,
+                              otl_circadian_schedule_getter_fn_t schedule_getter,
+                              void *schedule_ctx)
 {
     if (apply_cb == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -240,6 +260,8 @@ esp_err_t otl_circadian_start(otl_circadian_apply_fn_t apply_cb, void *apply_ctx
 
     s_apply_cb = apply_cb;
     s_apply_ctx = apply_ctx;
+    s_schedule_getter = schedule_getter;
+    s_schedule_ctx = schedule_ctx;
     s_started = true;
 
     BaseType_t ok = xTaskCreate(circadian_task, "otl_circadian", 4096, NULL, 3, NULL);
@@ -247,6 +269,8 @@ esp_err_t otl_circadian_start(otl_circadian_apply_fn_t apply_cb, void *apply_ctx
         s_started = false;
         s_apply_cb = NULL;
         s_apply_ctx = NULL;
+        s_schedule_getter = NULL;
+        s_schedule_ctx = NULL;
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
@@ -254,10 +278,15 @@ esp_err_t otl_circadian_start(otl_circadian_apply_fn_t apply_cb, void *apply_ctx
 
 #else
 
-esp_err_t otl_circadian_start(otl_circadian_apply_fn_t apply_cb, void *apply_ctx)
+esp_err_t otl_circadian_start(otl_circadian_apply_fn_t apply_cb,
+                              void *apply_ctx,
+                              otl_circadian_schedule_getter_fn_t schedule_getter,
+                              void *schedule_ctx)
 {
     (void)apply_cb;
     (void)apply_ctx;
+    (void)schedule_getter;
+    (void)schedule_ctx;
     return ESP_OK;
 }
 

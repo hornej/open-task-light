@@ -5,13 +5,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
-#include <string.h>     
+#include <string.h>
 #include <time.h>
 #include "sdkconfig.h"
 #include "esp_idf_version.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "esp_check.h"
 #include "esp_log.h"
 #if CONFIG_OTL_SERIAL_OUTPUT
 #define OTL_LOGI(tag, fmt, ...) ESP_LOGI(tag, fmt, ##__VA_ARGS__)
@@ -54,7 +55,6 @@
 #define OTL_LOG_RADARI(fmt, ...) do { (void)(fmt); } while (0)
 #endif
 
-#if CONFIG_OTL_SERIAL_OUTPUT
 static const char *otl_log_localtime(char *buf, size_t buf_len) __attribute__((unused));
 static const char *otl_log_localtime(char *buf, size_t buf_len)
 {
@@ -78,8 +78,8 @@ static const char *otl_log_localtime(char *buf, size_t buf_len)
 
     return buf;
 }
-#endif
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "driver/ledc.h"
 #include "driver/touch_pad.h"
 #include "esp_adc/adc_oneshot.h"
@@ -93,6 +93,8 @@ static const char *otl_log_localtime(char *buf, size_t buf_len)
 #include "esp_adc/adc_cali_scheme.h"
 #include "freertos/queue.h"
 #include "esp_intr_alloc.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 #include "otl_circadian.h"
 #include "otl_homekit.h"
 #include "otl_mqtt.h"
@@ -580,9 +582,20 @@ static float brightness_percent = 50.0f; // 1 … 100
 static float temp_ratio         = 0.5f;  // 0.0 warm … 1.0 cool
 
 #if CONFIG_OTL_CIRCADIAN_ENABLE
+#define OTL_RUNTIME_DEFAULT_CIRCADIAN_ENABLED true
+#define OTL_RUNTIME_DEFAULT_CIRCADIAN_COOLEST_TIME CONFIG_OTL_CIRCADIAN_COOLEST_TIME
+#define OTL_RUNTIME_DEFAULT_CIRCADIAN_WARMEST_TIME CONFIG_OTL_CIRCADIAN_WARMEST_TIME
 static float circadian_base_ratio = 0.5f;     // 0.0 warm .. 1.0 cool
 static float temp_ratio_user_offset = 0.0f;   // applied on top of circadian_base_ratio
+#else
+#define OTL_RUNTIME_DEFAULT_CIRCADIAN_ENABLED false
+#define OTL_RUNTIME_DEFAULT_CIRCADIAN_COOLEST_TIME "11:00"
+#define OTL_RUNTIME_DEFAULT_CIRCADIAN_WARMEST_TIME "23:00"
 #endif
+static bool runtime_circadian_enabled = OTL_RUNTIME_DEFAULT_CIRCADIAN_ENABLED;
+static char runtime_circadian_coolest_time[OTL_RUNTIME_TIME_STR_LEN] = OTL_RUNTIME_DEFAULT_CIRCADIAN_COOLEST_TIME;
+static char runtime_circadian_warmest_time[OTL_RUNTIME_TIME_STR_LEN] = OTL_RUNTIME_DEFAULT_CIRCADIAN_WARMEST_TIME;
+static bool runtime_verbose_diagnostics_enabled = false;
 
 static const int   BRIGHT_STEP      = 1;
 static const float TEMP_STEP        = 0.015f;
@@ -631,8 +644,16 @@ static esp_timer_handle_t pwm_log_timer = NULL;
 #endif
 static SemaphoreHandle_t otl_state_mutex = NULL;
 static bool radar_presence = false;
+static float telemetry_ambient_lux = NAN;
+static float telemetry_ntc_temp_c = NAN;
+static float telemetry_chip_temp_c = NAN;
+static bool telemetry_wifi_connected = false;
+static int telemetry_wifi_rssi_dbm = 0;
 
 static inline float clampf(float v, float lo, float hi);
+static esp_err_t otl_runtime_settings_init(void);
+static bool otl_runtime_parse_hhmm_seconds(const char *value, int *seconds_out);
+static void otl_runtime_store_defaults_locked(void);
 
 #if CONFIG_OTL_CIRCADIAN_ENABLE
 static void circadian_apply_current_ratio(void)
@@ -641,7 +662,9 @@ static void circadian_apply_current_ratio(void)
     float min_offset = -circadian_base_ratio;
     float max_offset = 1.0f - circadian_base_ratio;
     temp_ratio_user_offset = clampf(temp_ratio_user_offset, min_offset, max_offset);
-    temp_ratio = clampf(circadian_base_ratio + temp_ratio_user_offset, 0.0f, 1.0f);
+    if (runtime_circadian_enabled) {
+        temp_ratio = clampf(circadian_base_ratio + temp_ratio_user_offset, 0.0f, 1.0f);
+    }
 }
 #endif
 
@@ -649,8 +672,12 @@ static void otl_set_temp_ratio(float ratio)
 {
     ratio = clampf(ratio, 0.0f, 1.0f);
 #if CONFIG_OTL_CIRCADIAN_ENABLE
-    temp_ratio_user_offset = ratio - circadian_base_ratio;
-    circadian_apply_current_ratio();
+    if (runtime_circadian_enabled) {
+        temp_ratio_user_offset = ratio - circadian_base_ratio;
+        circadian_apply_current_ratio();
+    } else {
+        temp_ratio = ratio;
+    }
 #else
     temp_ratio = ratio;
 #endif
@@ -875,11 +902,8 @@ static bool radar_occupied        = false;
 static bool occupancy_faded_out   = false;
 static bool saved_led_state       = false;
 static int  saved_brightness      = 0;
-#if CONFIG_OTL_CIRCADIAN_ENABLE
 static float saved_temp_ratio_offset = 0.0f;
-#else
 static float saved_temp_ratio     = 0.5f;
-#endif
 // Detection and hysteresis tuning from menuconfig -> Open Task Light -> Radar detection.
 #define RADAR_MOVING_NEAR_MAX_CM      ((uint16_t)CONFIG_OTL_RADAR_MOVING_MAX_DISTANCE_CM)
 #define RADAR_PRESENCE_MAX_DIST_CM    ((uint16_t)CONFIG_OTL_RADAR_STATIONARY_MAX_DISTANCE_CM)
@@ -1198,14 +1222,46 @@ static void ws2812_set_rgb(uint8_t r, uint8_t g, uint8_t b)
 // Forward declaration so occupancy helpers can call it.
 static void update_outputs(void);
 
-#define OTL_MAX_STATE_LISTENERS 4
+#define OTL_MAX_STATE_LISTENERS     4
+#define OTL_MAX_TELEMETRY_LISTENERS 4
+#define OTL_MAX_SETTINGS_LISTENERS  4
+#define OTL_MAX_EVENT_LISTENERS     4
+#define OTL_RUNTIME_SETTINGS_NAMESPACE "otl_runtime"
+#define OTL_RUNTIME_KEY_CIRCADIAN_ENABLED "circ_en"
+#define OTL_RUNTIME_KEY_CIRCADIAN_COOL    "circ_cool"
+#define OTL_RUNTIME_KEY_CIRCADIAN_WARM    "circ_warm"
+#define OTL_RUNTIME_KEY_VERBOSE_DIAG      "diag_verbose"
 
 typedef struct {
     otl_state_listener_fn listener;
     void *ctx;
 } otl_state_listener_entry_t;
 
+typedef struct {
+    otl_telemetry_listener_fn listener;
+    void *ctx;
+} otl_telemetry_listener_entry_t;
+
+typedef struct {
+    otl_runtime_settings_listener_fn listener;
+    void *ctx;
+} otl_runtime_settings_listener_entry_t;
+
+typedef struct {
+    otl_event_listener_fn listener;
+    void *ctx;
+} otl_event_listener_entry_t;
+
 static otl_state_listener_entry_t otl_state_listeners[OTL_MAX_STATE_LISTENERS];
+static otl_telemetry_listener_entry_t otl_telemetry_listeners[OTL_MAX_TELEMETRY_LISTENERS];
+static otl_runtime_settings_listener_entry_t otl_runtime_settings_listeners[OTL_MAX_SETTINGS_LISTENERS];
+static otl_event_listener_entry_t otl_event_listeners[OTL_MAX_EVENT_LISTENERS];
+static otl_runtime_event_t s_last_event = {
+    .timestamp = "time=unset",
+    .level = OTL_EVENT_LEVEL_INFO,
+    .category = "system",
+    .message = "Booting",
+};
 
 static void otl_state_lock(void)
 {
@@ -1222,6 +1278,17 @@ static bool otl_state_float_changed(float a, float b)
     return fabsf(a - b) > 0.0005f;
 }
 
+static bool otl_runtime_float_changed(float a, float b, float epsilon)
+{
+    if (isnan(a) && isnan(b)) {
+        return false;
+    }
+    if (isnan(a) != isnan(b)) {
+        return true;
+    }
+    return fabsf(a - b) > epsilon;
+}
+
 static void otl_state_snapshot_locked(otl_public_state_t *state)
 {
     if (state == NULL) {
@@ -1232,6 +1299,50 @@ static void otl_state_snapshot_locked(otl_public_state_t *state)
     state->brightness_percent = brightness_percent;
     state->temp_ratio = temp_ratio;
     state->presence = radar_presence;
+}
+
+static void otl_telemetry_snapshot_locked(otl_telemetry_t *telemetry)
+{
+    if (telemetry == NULL) {
+        return;
+    }
+
+    telemetry->ambient_lux = telemetry_ambient_lux;
+    telemetry->ntc_temp_c = telemetry_ntc_temp_c;
+    telemetry->chip_temp_c = telemetry_chip_temp_c;
+    telemetry->thermal_brightness_cap_percent = thermal_brightness_cap_percent;
+    telemetry->thermal_limited = thermal_ntc_hot || thermal_chip_hot;
+    telemetry->thermal_ntc_hot = thermal_ntc_hot;
+    telemetry->thermal_chip_hot = thermal_chip_hot;
+    telemetry->wifi_connected = telemetry_wifi_connected;
+    telemetry->wifi_rssi_dbm = telemetry_wifi_rssi_dbm;
+}
+
+static void otl_runtime_settings_snapshot_locked(otl_runtime_settings_t *settings)
+{
+    if (settings == NULL) {
+        return;
+    }
+
+    settings->circadian_enabled = runtime_circadian_enabled;
+    snprintf(settings->circadian_coolest_time,
+             sizeof(settings->circadian_coolest_time),
+             "%s",
+             runtime_circadian_coolest_time);
+    snprintf(settings->circadian_warmest_time,
+             sizeof(settings->circadian_warmest_time),
+             "%s",
+             runtime_circadian_warmest_time);
+    settings->verbose_diagnostics_enabled = runtime_verbose_diagnostics_enabled;
+}
+
+static void otl_event_snapshot_locked(otl_runtime_event_t *event)
+{
+    if (event == NULL) {
+        return;
+    }
+
+    *event = s_last_event;
 }
 
 static void otl_state_notify_listeners(const otl_public_state_t *state,
@@ -1254,6 +1365,214 @@ static void otl_state_notify_listeners(const otl_public_state_t *state,
     }
 }
 
+static void otl_telemetry_notify_listeners(const otl_telemetry_t *telemetry)
+{
+    otl_telemetry_listener_entry_t listeners[OTL_MAX_TELEMETRY_LISTENERS] = {0};
+    size_t listener_count = 0;
+
+    otl_state_lock();
+    for (size_t i = 0; i < OTL_MAX_TELEMETRY_LISTENERS; ++i) {
+        if (otl_telemetry_listeners[i].listener == NULL) {
+            continue;
+        }
+        listeners[listener_count++] = otl_telemetry_listeners[i];
+    }
+    otl_state_unlock();
+
+    for (size_t i = 0; i < listener_count; ++i) {
+        listeners[i].listener(telemetry, listeners[i].ctx);
+    }
+}
+
+static void otl_runtime_settings_notify_listeners(const otl_runtime_settings_t *settings,
+                                                  otl_change_source_t source)
+{
+    otl_runtime_settings_listener_entry_t listeners[OTL_MAX_SETTINGS_LISTENERS] = {0};
+    size_t listener_count = 0;
+
+    otl_state_lock();
+    for (size_t i = 0; i < OTL_MAX_SETTINGS_LISTENERS; ++i) {
+        if (otl_runtime_settings_listeners[i].listener == NULL) {
+            continue;
+        }
+        listeners[listener_count++] = otl_runtime_settings_listeners[i];
+    }
+    otl_state_unlock();
+
+    for (size_t i = 0; i < listener_count; ++i) {
+        listeners[i].listener(settings, source, listeners[i].ctx);
+    }
+}
+
+static void otl_event_notify_listeners(const otl_runtime_event_t *event)
+{
+    otl_event_listener_entry_t listeners[OTL_MAX_EVENT_LISTENERS] = {0};
+    size_t listener_count = 0;
+
+    otl_state_lock();
+    for (size_t i = 0; i < OTL_MAX_EVENT_LISTENERS; ++i) {
+        if (otl_event_listeners[i].listener == NULL) {
+            continue;
+        }
+        listeners[listener_count++] = otl_event_listeners[i];
+    }
+    otl_state_unlock();
+
+    for (size_t i = 0; i < listener_count; ++i) {
+        listeners[i].listener(event, listeners[i].ctx);
+    }
+}
+
+static bool otl_runtime_parse_hhmm_seconds(const char *value, int *seconds_out)
+{
+    if (value == NULL || seconds_out == NULL) {
+        return false;
+    }
+
+    int hour = 0;
+    int minute = 0;
+    if (strlen(value) != 5 || value[2] != ':') {
+        return false;
+    }
+    if (sscanf(value, "%2d:%2d", &hour, &minute) != 2) {
+        return false;
+    }
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+        return false;
+    }
+
+    *seconds_out = (hour * 3600) + (minute * 60);
+    return true;
+}
+
+static void otl_runtime_store_defaults_locked(void)
+{
+    runtime_circadian_enabled = OTL_RUNTIME_DEFAULT_CIRCADIAN_ENABLED;
+    snprintf(runtime_circadian_coolest_time,
+             sizeof(runtime_circadian_coolest_time),
+             "%s",
+             OTL_RUNTIME_DEFAULT_CIRCADIAN_COOLEST_TIME);
+    snprintf(runtime_circadian_warmest_time,
+             sizeof(runtime_circadian_warmest_time),
+             "%s",
+             OTL_RUNTIME_DEFAULT_CIRCADIAN_WARMEST_TIME);
+    runtime_verbose_diagnostics_enabled = false;
+}
+
+static esp_err_t otl_runtime_nvs_init(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    if (err == ESP_ERR_INVALID_STATE) {
+        return ESP_OK;
+    }
+    return err;
+}
+
+static esp_err_t otl_runtime_save_u8(const char *key, uint8_t value)
+{
+    nvs_handle_t handle = 0;
+    esp_err_t err = otl_runtime_nvs_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_open(OTL_RUNTIME_SETTINGS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_set_u8(handle, key, value);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err;
+}
+
+static esp_err_t otl_runtime_save_str(const char *key, const char *value)
+{
+    nvs_handle_t handle = 0;
+    esp_err_t err = otl_runtime_nvs_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_open(OTL_RUNTIME_SETTINGS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_set_str(handle, key, value);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err;
+}
+
+static esp_err_t otl_runtime_settings_init(void)
+{
+    bool circadian_enabled = OTL_RUNTIME_DEFAULT_CIRCADIAN_ENABLED;
+    bool verbose_enabled = false;
+    char coolest_time[OTL_RUNTIME_TIME_STR_LEN] = OTL_RUNTIME_DEFAULT_CIRCADIAN_COOLEST_TIME;
+    char warmest_time[OTL_RUNTIME_TIME_STR_LEN] = OTL_RUNTIME_DEFAULT_CIRCADIAN_WARMEST_TIME;
+    uint8_t stored_u8 = 0;
+    char stored_time[OTL_RUNTIME_TIME_STR_LEN] = {0};
+    size_t stored_len = 0;
+    nvs_handle_t handle = 0;
+    esp_err_t err = ESP_OK;
+
+    err = otl_runtime_nvs_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_open(OTL_RUNTIME_SETTINGS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_OK) {
+#if CONFIG_OTL_CIRCADIAN_ENABLE
+        if (nvs_get_u8(handle, OTL_RUNTIME_KEY_CIRCADIAN_ENABLED, &stored_u8) == ESP_OK) {
+            circadian_enabled = (stored_u8 != 0);
+        }
+
+        stored_len = sizeof(stored_time);
+        memset(stored_time, 0, sizeof(stored_time));
+        if (nvs_get_str(handle, OTL_RUNTIME_KEY_CIRCADIAN_COOL, stored_time, &stored_len) == ESP_OK &&
+            otl_runtime_parse_hhmm_seconds(stored_time, &(int){0})) {
+            snprintf(coolest_time, sizeof(coolest_time), "%s", stored_time);
+        }
+
+        stored_len = sizeof(stored_time);
+        memset(stored_time, 0, sizeof(stored_time));
+        if (nvs_get_str(handle, OTL_RUNTIME_KEY_CIRCADIAN_WARM, stored_time, &stored_len) == ESP_OK &&
+            otl_runtime_parse_hhmm_seconds(stored_time, &(int){0})) {
+            snprintf(warmest_time, sizeof(warmest_time), "%s", stored_time);
+        }
+#endif
+        if (nvs_get_u8(handle, OTL_RUNTIME_KEY_VERBOSE_DIAG, &stored_u8) == ESP_OK) {
+            verbose_enabled = (stored_u8 != 0);
+        }
+        nvs_close(handle);
+    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+        return err;
+    }
+
+    otl_state_lock();
+    otl_runtime_store_defaults_locked();
+#if CONFIG_OTL_CIRCADIAN_ENABLE
+    runtime_circadian_enabled = circadian_enabled;
+    snprintf(runtime_circadian_coolest_time, sizeof(runtime_circadian_coolest_time), "%s", coolest_time);
+    snprintf(runtime_circadian_warmest_time, sizeof(runtime_circadian_warmest_time), "%s", warmest_time);
+#endif
+    runtime_verbose_diagnostics_enabled = verbose_enabled;
+    otl_state_unlock();
+
+    return ESP_OK;
+}
+
 void otl_state_get_public(otl_public_state_t *state)
 {
     if (state == NULL) {
@@ -1262,6 +1581,39 @@ void otl_state_get_public(otl_public_state_t *state)
 
     otl_state_lock();
     otl_state_snapshot_locked(state);
+    otl_state_unlock();
+}
+
+void otl_telemetry_get_public(otl_telemetry_t *telemetry)
+{
+    if (telemetry == NULL) {
+        return;
+    }
+
+    otl_state_lock();
+    otl_telemetry_snapshot_locked(telemetry);
+    otl_state_unlock();
+}
+
+void otl_runtime_settings_get(otl_runtime_settings_t *settings)
+{
+    if (settings == NULL) {
+        return;
+    }
+
+    otl_state_lock();
+    otl_runtime_settings_snapshot_locked(settings);
+    otl_state_unlock();
+}
+
+void otl_event_get_last(otl_runtime_event_t *event)
+{
+    if (event == NULL) {
+        return;
+    }
+
+    otl_state_lock();
+    otl_event_snapshot_locked(event);
     otl_state_unlock();
 }
 
@@ -1331,6 +1683,9 @@ bool otl_state_set_presence(bool presence, otl_change_source_t source)
 
     if (changed) {
         otl_state_notify_listeners(&state, source);
+        otl_event_emit(OTL_EVENT_LEVEL_INFO,
+                       "occupancy",
+                       presence ? "Occupancy detected" : "Occupancy cleared");
     }
 
     return changed;
@@ -1356,6 +1711,66 @@ esp_err_t otl_state_add_listener(otl_state_listener_fn listener, void *ctx)
     return ESP_ERR_NO_MEM;
 }
 
+esp_err_t otl_telemetry_add_listener(otl_telemetry_listener_fn listener, void *ctx)
+{
+    if (listener == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    otl_state_lock();
+    for (size_t i = 0; i < OTL_MAX_TELEMETRY_LISTENERS; ++i) {
+        if (otl_telemetry_listeners[i].listener != NULL) {
+            continue;
+        }
+        otl_telemetry_listeners[i].listener = listener;
+        otl_telemetry_listeners[i].ctx = ctx;
+        otl_state_unlock();
+        return ESP_OK;
+    }
+    otl_state_unlock();
+    return ESP_ERR_NO_MEM;
+}
+
+esp_err_t otl_runtime_settings_add_listener(otl_runtime_settings_listener_fn listener, void *ctx)
+{
+    if (listener == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    otl_state_lock();
+    for (size_t i = 0; i < OTL_MAX_SETTINGS_LISTENERS; ++i) {
+        if (otl_runtime_settings_listeners[i].listener != NULL) {
+            continue;
+        }
+        otl_runtime_settings_listeners[i].listener = listener;
+        otl_runtime_settings_listeners[i].ctx = ctx;
+        otl_state_unlock();
+        return ESP_OK;
+    }
+    otl_state_unlock();
+    return ESP_ERR_NO_MEM;
+}
+
+esp_err_t otl_event_add_listener(otl_event_listener_fn listener, void *ctx)
+{
+    if (listener == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    otl_state_lock();
+    for (size_t i = 0; i < OTL_MAX_EVENT_LISTENERS; ++i) {
+        if (otl_event_listeners[i].listener != NULL) {
+            continue;
+        }
+        otl_event_listeners[i].listener = listener;
+        otl_event_listeners[i].ctx = ctx;
+        otl_state_unlock();
+        return ESP_OK;
+    }
+    otl_state_unlock();
+    return ESP_ERR_NO_MEM;
+}
+
 void otl_state_notify_current(otl_change_source_t source)
 {
     otl_public_state_t state = {0};
@@ -1363,10 +1778,290 @@ void otl_state_notify_current(otl_change_source_t source)
     otl_state_notify_listeners(&state, source);
 }
 
+void otl_telemetry_notify_current(void)
+{
+    otl_telemetry_t telemetry = {0};
+    otl_telemetry_get_public(&telemetry);
+    otl_telemetry_notify_listeners(&telemetry);
+}
+
+void otl_runtime_settings_notify_current(otl_change_source_t source)
+{
+    otl_runtime_settings_t settings = {0};
+    otl_runtime_settings_get(&settings);
+    otl_runtime_settings_notify_listeners(&settings, source);
+}
+
+void otl_event_notify_current(void)
+{
+    otl_runtime_event_t event = {0};
+    otl_event_get_last(&event);
+    otl_event_notify_listeners(&event);
+}
+
+bool otl_runtime_verbose_diagnostics_enabled(void)
+{
+    bool enabled = false;
+
+    otl_state_lock();
+    enabled = runtime_verbose_diagnostics_enabled;
+    otl_state_unlock();
+    return enabled;
+}
+
+bool otl_runtime_circadian_is_enabled(void)
+{
+#if CONFIG_OTL_CIRCADIAN_ENABLE
+    bool enabled = false;
+
+    otl_state_lock();
+    enabled = runtime_circadian_enabled;
+    otl_state_unlock();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+bool otl_runtime_get_circadian_schedule(int *coolest_seconds, int *warmest_seconds)
+{
+    otl_runtime_settings_t settings = {0};
+    int coolest = 0;
+    int warmest = 0;
+
+    if (coolest_seconds == NULL || warmest_seconds == NULL) {
+        return false;
+    }
+
+    otl_runtime_settings_get(&settings);
+    if (!otl_runtime_parse_hhmm_seconds(settings.circadian_coolest_time, &coolest) ||
+        !otl_runtime_parse_hhmm_seconds(settings.circadian_warmest_time, &warmest)) {
+        return false;
+    }
+
+    *coolest_seconds = coolest;
+    *warmest_seconds = warmest;
+    return true;
+}
+
+esp_err_t otl_runtime_set_verbose_diagnostics(bool enabled, otl_change_source_t source)
+{
+    otl_runtime_settings_t settings = {0};
+
+    ESP_RETURN_ON_ERROR(otl_runtime_save_u8(OTL_RUNTIME_KEY_VERBOSE_DIAG, enabled ? 1U : 0U),
+                        "runtime",
+                        "Failed to save verbose diagnostics setting");
+
+    otl_state_lock();
+    if (runtime_verbose_diagnostics_enabled == enabled) {
+        otl_state_unlock();
+        return ESP_OK;
+    }
+    runtime_verbose_diagnostics_enabled = enabled;
+    otl_runtime_settings_snapshot_locked(&settings);
+    otl_state_unlock();
+
+    otl_runtime_settings_notify_listeners(&settings, source);
+    otl_event_emit(OTL_EVENT_LEVEL_INFO,
+                   "diagnostics",
+                   enabled ? "Verbose diagnostics enabled" : "Verbose diagnostics disabled");
+    return ESP_OK;
+}
+
+esp_err_t otl_runtime_set_circadian_enabled(bool enabled, otl_change_source_t source)
+{
+#if CONFIG_OTL_CIRCADIAN_ENABLE
+    otl_runtime_settings_t settings = {0};
+    otl_public_state_t state = {0};
+    bool state_changed = false;
+
+    ESP_RETURN_ON_ERROR(otl_runtime_save_u8(OTL_RUNTIME_KEY_CIRCADIAN_ENABLED, enabled ? 1U : 0U),
+                        "runtime",
+                        "Failed to save circadian enable setting");
+
+    otl_state_lock();
+    if (runtime_circadian_enabled == enabled) {
+        otl_state_unlock();
+        return ESP_OK;
+    }
+    runtime_circadian_enabled = enabled;
+    if (enabled) {
+        float prev_temp_ratio = temp_ratio;
+        circadian_apply_current_ratio();
+        state_changed = otl_state_float_changed(prev_temp_ratio, temp_ratio);
+        if (state_changed && led_state) {
+            update_outputs();
+        }
+        if (state_changed) {
+            otl_state_snapshot_locked(&state);
+        }
+    }
+    otl_runtime_settings_snapshot_locked(&settings);
+    otl_state_unlock();
+
+    otl_runtime_settings_notify_listeners(&settings, source);
+    if (state_changed) {
+        otl_state_notify_listeners(&state, source);
+    }
+    otl_event_emit(OTL_EVENT_LEVEL_INFO,
+                   "circadian",
+                   enabled ? "Firmware circadian enabled" : "Firmware circadian disabled");
+    return ESP_OK;
+#else
+    (void)enabled;
+    (void)source;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+esp_err_t otl_runtime_set_circadian_coolest_time(const char *hhmm, otl_change_source_t source)
+{
+    otl_runtime_settings_t settings = {0};
+    char event_message[OTL_RUNTIME_EVENT_MESSAGE_LEN] = {0};
+
+    if (!otl_runtime_parse_hhmm_seconds(hhmm, &(int){0})) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_RETURN_ON_ERROR(otl_runtime_save_str(OTL_RUNTIME_KEY_CIRCADIAN_COOL, hhmm),
+                        "runtime",
+                        "Failed to save coolest time");
+
+    otl_state_lock();
+    if (strncmp(runtime_circadian_coolest_time, hhmm, sizeof(runtime_circadian_coolest_time)) == 0) {
+        otl_state_unlock();
+        return ESP_OK;
+    }
+    snprintf(runtime_circadian_coolest_time, sizeof(runtime_circadian_coolest_time), "%s", hhmm);
+    otl_runtime_settings_snapshot_locked(&settings);
+    otl_state_unlock();
+
+    otl_runtime_settings_notify_listeners(&settings, source);
+    snprintf(event_message, sizeof(event_message), "Updated coolest time to %s", hhmm);
+    otl_event_emit(OTL_EVENT_LEVEL_INFO, "circadian", event_message);
+    return ESP_OK;
+}
+
+esp_err_t otl_runtime_set_circadian_warmest_time(const char *hhmm, otl_change_source_t source)
+{
+    otl_runtime_settings_t settings = {0};
+    char event_message[OTL_RUNTIME_EVENT_MESSAGE_LEN] = {0};
+
+    if (!otl_runtime_parse_hhmm_seconds(hhmm, &(int){0})) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_RETURN_ON_ERROR(otl_runtime_save_str(OTL_RUNTIME_KEY_CIRCADIAN_WARM, hhmm),
+                        "runtime",
+                        "Failed to save warmest time");
+
+    otl_state_lock();
+    if (strncmp(runtime_circadian_warmest_time, hhmm, sizeof(runtime_circadian_warmest_time)) == 0) {
+        otl_state_unlock();
+        return ESP_OK;
+    }
+    snprintf(runtime_circadian_warmest_time, sizeof(runtime_circadian_warmest_time), "%s", hhmm);
+    otl_runtime_settings_snapshot_locked(&settings);
+    otl_state_unlock();
+
+    otl_runtime_settings_notify_listeners(&settings, source);
+    snprintf(event_message, sizeof(event_message), "Updated warmest time to %s", hhmm);
+    otl_event_emit(OTL_EVENT_LEVEL_INFO, "circadian", event_message);
+    return ESP_OK;
+}
+
+const char *otl_event_level_to_string(otl_event_level_t level)
+{
+    switch (level) {
+        case OTL_EVENT_LEVEL_WARNING:
+            return "warning";
+        case OTL_EVENT_LEVEL_ERROR:
+            return "error";
+        case OTL_EVENT_LEVEL_INFO:
+        default:
+            return "info";
+    }
+}
+
+void otl_event_emit(otl_event_level_t level, const char *category, const char *message)
+{
+    otl_runtime_event_t event = {0};
+
+    if (category == NULL || message == NULL) {
+        return;
+    }
+
+    otl_state_lock();
+    snprintf(s_last_event.timestamp,
+             sizeof(s_last_event.timestamp),
+             "%s",
+             otl_log_localtime((char[OTL_RUNTIME_EVENT_TIMESTAMP_LEN]){0},
+                               OTL_RUNTIME_EVENT_TIMESTAMP_LEN));
+    s_last_event.level = level;
+    snprintf(s_last_event.category, sizeof(s_last_event.category), "%s", category);
+    snprintf(s_last_event.message, sizeof(s_last_event.message), "%s", message);
+    otl_event_snapshot_locked(&event);
+    otl_state_unlock();
+
+    otl_event_notify_listeners(&event);
+}
+
+static bool otl_telemetry_update(float lux,
+                                 float ntc_temp_c,
+                                 float chip_temp_c,
+                                 bool wifi_connected,
+                                 int wifi_rssi_dbm)
+{
+    bool changed = false;
+    bool wifi_changed = false;
+    otl_telemetry_t telemetry = {0};
+
+    otl_state_lock();
+    wifi_changed = (telemetry_wifi_connected != wifi_connected);
+
+    if (otl_runtime_float_changed(telemetry_ambient_lux, lux, 0.5f)) {
+        telemetry_ambient_lux = lux;
+        changed = true;
+    }
+    if (otl_runtime_float_changed(telemetry_ntc_temp_c, ntc_temp_c, 0.1f)) {
+        telemetry_ntc_temp_c = ntc_temp_c;
+        changed = true;
+    }
+    if (otl_runtime_float_changed(telemetry_chip_temp_c, chip_temp_c, 0.1f)) {
+        telemetry_chip_temp_c = chip_temp_c;
+        changed = true;
+    }
+    if (telemetry_wifi_connected != wifi_connected) {
+        telemetry_wifi_connected = wifi_connected;
+        changed = true;
+    }
+    if (telemetry_wifi_rssi_dbm != wifi_rssi_dbm) {
+        telemetry_wifi_rssi_dbm = wifi_rssi_dbm;
+        changed = true;
+    }
+    if (changed) {
+        otl_telemetry_snapshot_locked(&telemetry);
+    }
+    otl_state_unlock();
+
+    if (changed) {
+        otl_telemetry_notify_listeners(&telemetry);
+    }
+    if (wifi_changed) {
+        otl_event_emit(OTL_EVENT_LEVEL_INFO,
+                       "wifi",
+                       wifi_connected ? "WiFi connected" : "WiFi disconnected");
+    }
+
+    return changed;
+}
+
 static void thermal_update(float ntc_c, float chip_c)
 {
     bool prev_ntc_hot = false;
     bool prev_chip_hot = false;
+    bool curr_ntc_hot = false;
+    bool curr_chip_hot = false;
     bool throttled = false;
     float new_cap = (float)MAX_BRIGHTNESS_PERCENT;
 
@@ -1418,21 +2113,38 @@ static void thermal_update(float ntc_c, float chip_c)
             update_outputs();
         }
     }
+    curr_ntc_hot = thermal_ntc_hot;
+    curr_chip_hot = thermal_chip_hot;
     otl_state_unlock();
 
-    if ((prev_ntc_hot != thermal_ntc_hot) || (prev_chip_hot != thermal_chip_hot)) {
+    if ((prev_ntc_hot != curr_ntc_hot) || (prev_chip_hot != curr_chip_hot)) {
         OTL_LOGW("thermal",
                  "Thermal %s (NTC=%s%.1fC, Chip=%s%.1fC) -> max=%.0f%%",
                  throttled ? "LIMIT" : "OK",
-                 thermal_ntc_hot ? "HOT " : "",
+                 curr_ntc_hot ? "HOT " : "",
                  ntc_c,
-                 thermal_chip_hot ? "HOT " : "",
+                 curr_chip_hot ? "HOT " : "",
                  chip_c,
                  new_cap);
+        otl_event_emit(OTL_EVENT_LEVEL_WARNING,
+                       "thermal",
+                       throttled ? "Thermal limit active" : "Thermal limit cleared");
     }
 }
 
 #if CONFIG_OTL_CIRCADIAN_ENABLE
+static bool otl_circadian_schedule_getter(otl_circadian_schedule_t *schedule, void *ctx)
+{
+    (void)ctx;
+
+    if (schedule == NULL) {
+        return false;
+    }
+
+    return otl_runtime_get_circadian_schedule(&schedule->coolest_seconds,
+                                              &schedule->warmest_seconds);
+}
+
 static void otl_circadian_apply_cb(float base_ratio, void *ctx)
 {
     bool changed = false;
@@ -1443,7 +2155,7 @@ static void otl_circadian_apply_cb(float base_ratio, void *ctx)
     float prev_temp_ratio = temp_ratio;
     circadian_base_ratio = base_ratio;
     circadian_apply_current_ratio();
-    changed = otl_state_float_changed(prev_temp_ratio, temp_ratio);
+    changed = runtime_circadian_enabled && otl_state_float_changed(prev_temp_ratio, temp_ratio);
     if (led_state && changed) {
         update_outputs();
     }
@@ -1504,11 +2216,8 @@ static void handle_occupancy_lost(void)
     saved_led_state  = led_state;
     saved_brightness = (int)lroundf(fminf(brightness_percent, (float)MAX_BRIGHTNESS_PERCENT));
     fade_start = (int)lroundf(brightness_percent);
-#if CONFIG_OTL_CIRCADIAN_ENABLE
     saved_temp_ratio_offset = temp_ratio_user_offset;
-#else
     saved_temp_ratio = temp_ratio;
-#endif
     otl_state_unlock();
 
     // Fade down to 0% brightness, then turn off.
@@ -1536,8 +2245,12 @@ static void handle_occupancy_gained(void)
 
     fade_end = saved_brightness;
 #if CONFIG_OTL_CIRCADIAN_ENABLE
-    temp_ratio_user_offset = saved_temp_ratio_offset;
-    circadian_apply_current_ratio();
+    if (runtime_circadian_enabled) {
+        temp_ratio_user_offset = saved_temp_ratio_offset;
+        circadian_apply_current_ratio();
+    } else {
+        temp_ratio = saved_temp_ratio;
+    }
 #else
     temp_ratio = saved_temp_ratio;
 #endif
@@ -1644,6 +2357,22 @@ static float read_chip_temperature(void)
 static void chip_temp_init(void) {}
 static float read_chip_temperature(void) { return NAN; }
 #endif
+
+static bool read_wifi_rssi(int *rssi_out)
+{
+    wifi_ap_record_t ap_info = {0};
+
+    if (rssi_out == NULL || !otl_net_wifi_is_connected()) {
+        return false;
+    }
+
+    if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
+        return false;
+    }
+
+    *rssi_out = ap_info.rssi;
+    return true;
+}
 
 static void adc_init(void)
 {
@@ -2385,22 +3114,49 @@ static void sensor_task(void *arg)
 {
     (void)arg;
     TickType_t last_wake = xTaskGetTickCount();
+    uint32_t verbose_diag_elapsed_ms = SENSOR_READ_INTERVAL_MS;
 #if CONFIG_OTL_SERIAL_OUTPUT && (CONFIG_OTL_LOG_STATUS || CONFIG_OTL_SENSOR_DEBUG)
     uint32_t log_elapsed_ms = SENSOR_READ_INTERVAL_MS;
 #endif
 
     while (1) {
+        float lux = read_als_lux();
         float ntc_temp  = read_ntc_temperature();
         float chip_temp = read_chip_temperature();
+        bool wifi_connected = otl_net_wifi_is_connected();
+        int wifi_rssi_dbm = telemetry_wifi_rssi_dbm;
 
         thermal_update(ntc_temp, chip_temp);
+        if (wifi_connected) {
+            (void)read_wifi_rssi(&wifi_rssi_dbm);
+        } else {
+            wifi_rssi_dbm = 0;
+        }
+
+        (void)otl_telemetry_update(lux, ntc_temp, chip_temp, wifi_connected, wifi_rssi_dbm);
+
+        verbose_diag_elapsed_ms += THERMAL_POLL_INTERVAL_MS;
+        if (verbose_diag_elapsed_ms >= SENSOR_READ_INTERVAL_MS &&
+            otl_runtime_verbose_diagnostics_enabled()) {
+            char event_message[OTL_RUNTIME_EVENT_MESSAGE_LEN] = {0};
+
+            verbose_diag_elapsed_ms = 0;
+            snprintf(event_message,
+                     sizeof(event_message),
+                     "Sensors lux=%.0f ntc=%.1fC chip=%.1fC cap=%.0f%% rssi=%ddBm",
+                     lux,
+                     ntc_temp,
+                     chip_temp,
+                     thermal_brightness_cap_percent,
+                     wifi_rssi_dbm);
+            otl_event_emit(OTL_EVENT_LEVEL_INFO, "diagnostics", event_message);
+        }
 
 #if CONFIG_OTL_SERIAL_OUTPUT && (CONFIG_OTL_LOG_STATUS || CONFIG_OTL_SENSOR_DEBUG)
         log_elapsed_ms += THERMAL_POLL_INTERVAL_MS;
         if (log_elapsed_ms >= SENSOR_READ_INTERVAL_MS) {
             otl_public_state_t state = {0};
             log_elapsed_ms = 0;
-            float lux = read_als_lux();
             otl_state_get_public(&state);
 #if CONFIG_OTL_LOG_STATUS
             const char *light_state = state.is_on ? "ON" : "OFF";
@@ -2508,6 +3264,11 @@ void app_main(void)
     otl_state_mutex = xSemaphoreCreateMutex();
     if (otl_state_mutex == NULL) {
         abort();
+    }
+
+    esp_err_t runtime_settings_err = otl_runtime_settings_init();
+    if (runtime_settings_err != ESP_OK) {
+        OTL_LOGE("runtime", "Settings init failed: %s", esp_err_to_name(runtime_settings_err));
     }
 
     // 2. WS2812 via RMT LED-Strip driver
@@ -2620,7 +3381,10 @@ void app_main(void)
 #endif
 
 #if CONFIG_OTL_CIRCADIAN_ENABLE
-    esp_err_t circadian_err = otl_circadian_start(otl_circadian_apply_cb, NULL);
+    esp_err_t circadian_err = otl_circadian_start(otl_circadian_apply_cb,
+                                                  NULL,
+                                                  otl_circadian_schedule_getter,
+                                                  NULL);
     if (circadian_err != ESP_OK) {
         OTL_LOGE("circadian", "Start failed: %s", esp_err_to_name(circadian_err));
     }
@@ -2654,6 +3418,8 @@ void app_main(void)
     otl_state_lock();
     update_outputs();
     otl_state_unlock();
+
+    otl_event_emit(OTL_EVENT_LEVEL_INFO, "system", "Boot complete");
     
     OTL_LOGI("main", "Open Task Light initialization complete");
 }
