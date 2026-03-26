@@ -605,6 +605,7 @@ static const float GAMMA_CORRECTION = 1.6f;
 // Limit maximum brightness to avoid overheating
 static const int   MAX_BRIGHTNESS_PERCENT = 95;
 static const float MIN_BRIGHTNESS_PERCENT = 5.0f;
+static const float MIN_BRIGHTNESS_HOLD_EPSILON_PERCENT = 0.5f;
 
 // ---------------------------- Thermal protection ------------------------------
 // If either sensor crosses the "hot" threshold, clamp the *effective* maximum
@@ -2684,6 +2685,16 @@ static inline float brightness_deep_dim_min_repeat_ms(float b_percent)
     return 0.0f;
 }
 
+static inline bool brightness_is_above_normal_min(float brightness_percent)
+{
+    return brightness_percent > (MIN_BRIGHTNESS_PERCENT + MIN_BRIGHTNESS_HOLD_EPSILON_PERCENT);
+}
+
+static inline bool brightness_is_at_or_near_normal_min(float brightness_percent)
+{
+    return !brightness_is_above_normal_min(brightness_percent);
+}
+
 // --- Tap/double-tap tracking ---
 static uint32_t tap_last_ms[PAD_COUNT] = {0};
 
@@ -2691,6 +2702,7 @@ static uint32_t button_press_time[PAD_COUNT] = {0};
 static uint32_t last_repeat_time[PAD_COUNT] = {0};
 static bool button_being_held[PAD_COUNT] = {0};
 static bool dim_down_hold_clamp_at_min = false;
+static bool dim_down_release_allows_deep_dim = false;
 
 
 // --- Touch event processing task ---
@@ -2822,6 +2834,9 @@ static void touch_task(void *arg)
             otl_state_get_public(&state);
             bool was_off = !state.is_on;
             float current_brightness = was_off ? MIN_BRIGHTNESS_PERCENT : state.brightness_percent;
+            bool at_or_near_normal_min = brightness_is_at_or_near_normal_min(current_brightness);
+            bool allow_deep_dim_on_this_hold =
+                dim_down_release_allows_deep_dim && at_or_near_normal_min && !was_off;
              
             if (!button_being_held[2]) {
                 button_being_held[2] = true;
@@ -2831,7 +2846,8 @@ static void touch_task(void *arg)
                 // double-tap minimum) on the same press-and-hold. If we started
                 // above MIN, or we just turned on from OFF, clamp this hold at
                 // MIN until the user releases and holds again.
-                dim_down_hold_clamp_at_min = was_off || (current_brightness > MIN_BRIGHTNESS_PERCENT);
+                dim_down_hold_clamp_at_min = !(allow_deep_dim_on_this_hold || at_or_near_normal_min) || was_off;
+                dim_down_release_allows_deep_dim = false;
 
                 if ((current_brightness >= MIN_BRIGHTNESS_PERCENT) && (now - tap_last_ms[2] < DOUBLE_TAP_MS)) {
                     otl_state_apply_light_update(&(otl_light_update_t) {
@@ -2844,7 +2860,9 @@ static void touch_task(void *arg)
                     OTL_LOG_TOUCHI("Brightness set to MIN (%d%%)", (int)lroundf(MIN_BRIGHTNESS_PERCENT));
                     tap_last_ms[2] = now;
                 } else {
-                    float min_limit = (current_brightness > MIN_BRIGHTNESS_PERCENT) ? MIN_BRIGHTNESS_PERCENT : HOLD_MIN_BRIGHTNESS_PERCENT;
+                    float min_limit = brightness_is_above_normal_min(current_brightness)
+                                          ? MIN_BRIGHTNESS_PERCENT
+                                          : HOLD_MIN_BRIGHTNESS_PERCENT;
                     float new_brightness = fmaxf(current_brightness - (float)BRIGHT_STEP, min_limit);
                     if (new_brightness != current_brightness) {
                         otl_state_apply_light_update(&(otl_light_update_t) {
@@ -2935,6 +2953,11 @@ static void touch_task(void *arg)
                 if (!pressed_now[i]) {
                     button_being_held[i] = false;
                     if (i == 2) {
+                        otl_public_state_t released_state = {0};
+                        otl_state_get_public(&released_state);
+                        dim_down_release_allows_deep_dim =
+                            dim_down_hold_clamp_at_min &&
+                            brightness_is_at_or_near_normal_min(released_state.brightness_percent);
                         dim_down_hold_clamp_at_min = false;
                     }
                     continue;
