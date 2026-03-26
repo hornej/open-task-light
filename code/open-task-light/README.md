@@ -1,20 +1,82 @@
 # Open Task Light
 
-Firmware and configs for the Open Task Light: an ESP32-S3 task light with
+Firmware and configs for Open Task Light: an ESP32-S3 task light with
 capacitive touch controls, warm/cool PWM channels, a WS2812 status LED, and
 optional LD2410B presence sensing.
 
 There are three supported build paths in this repo:
-- ESP-IDF (native firmware)
-- ESPHome (Home Assistant)
-- Arduino (standalone sketch)
+- ESP-IDF native firmware
+- ESPHome configuration
+- Arduino standalone sketch
 
-## Build options
+The ESP-IDF firmware is the primary implementation and has the most complete
+feature set.
 
-### ESP-IDF (native firmware)
+## What The Light Does
+
+Hardware and local behavior:
+- 5 capacitive touch pads: power, brightness up, brightness down, cooler, warmer
+- 2 PWM LED channels: warm white and cool white
+- WS2812 status LED
+- optional LD2410B presence sensor
+- ambient light sensor
+- LED NTC temperature sensor
+- ESP32-S3 internal temperature monitoring
+
+Optional connected behavior in the native firmware:
+- shared Wi-Fi station support
+- Home Assistant via native MQTT discovery
+- Apple Home via native HomeKit
+- Wi-Fi + SNTP circadian color temperature schedule
+
+## Using The Light
+
+### Touch controls
+
+- Power pad:
+  - tap toggles the light on or off
+  - if the light is off, pressing power turns it on immediately
+  - if you keep holding the power pad for about 3 seconds while turning on,
+    the WS2812 status LED is enabled for that on-cycle
+- Brightness up pad:
+  - single tap raises brightness by 1%
+  - double tap jumps to max brightness
+  - hold ramps brightness upward smoothly
+- Brightness down pad:
+  - single tap lowers brightness by 1%
+  - double tap jumps to the normal minimum brightness
+  - hold ramps brightness downward
+  - if you want the deepest dim range below the normal minimum, release and
+    hold dim-down again after reaching minimum
+- Cooler pad:
+  - single tap shifts color temperature cooler
+  - double tap jumps to maximum cool
+  - hold ramps cooler
+- Warmer pad:
+  - single tap shifts color temperature warmer
+  - double tap jumps to maximum warm
+  - hold ramps warmer
+
+### Presence behavior
+
+If the LD2410B presence sensor is installed and enabled:
+- occupancy turns on only after continuous presence for the configured on delay
+- occupancy turns off only after continuous absence for the configured timeout
+- when occupancy clears, the light fades out
+- when occupancy returns, the light fades back to its previous state
+
+### Thermal behavior
+
+- LED NTC temperature can clamp the maximum allowed brightness
+- ESP32-S3 internal temperature is monitored separately as a chip-side failsafe
+- the LED thermal limit is runtime-adjustable from Home Assistant when MQTT is enabled
+
+## ESP-IDF Native Firmware
+
 Source: `main/otl_main.c`
 
 Quick start:
+
 ```sh
 idf.py set-target esp32s3
 idf.py menuconfig
@@ -23,37 +85,165 @@ idf.py -p PORT flash monitor
 ```
 
 Checked-in defaults live in `sdkconfig.defaults`. Your `menuconfig` changes are
-written to the local `sdkconfig` file, which is intentionally ignored so Wi-Fi
-credentials and other machine-specific settings stay out of Git.
+written to the local `sdkconfig` file, which is intentionally ignored so
+Wi-Fi credentials and other machine-specific settings stay out of Git.
 
-Menuconfig options under `Open Task Light`:
-- `Enable serial log output` (`CONFIG_OTL_SERIAL_OUTPUT`)
-- `Enable periodic status logs (every 10s)` (`CONFIG_OTL_LOG_STATUS`)
-- `Enable sensor debug logs (raw ADC)` (`CONFIG_OTL_SENSOR_DEBUG`)
-- `Enable touch UI event logs` (`CONFIG_OTL_LOG_TOUCH_EVENTS`)
-- `Enable touch calibration logs` (`CONFIG_OTL_LOG_TOUCH_CAL`)
-- `Enable raw touch pad value logs` (`CONFIG_OTL_LOG_TOUCH_RAW`) + `Raw touch log interval (ms)` (`CONFIG_OTL_TOUCH_RAW_LOG_INTERVAL_MS`)
-- `Enable PWM duty logs during transitions` (`CONFIG_OTL_LOG_PWM_DUTY`) + `PWM duty log interval (ms)` (`CONFIG_OTL_PWM_LOG_INTERVAL_MS`)
-- `Enable presence sensor status logs` (`CONFIG_OTL_LOG_RADAR_STATUS`)
-- `Enable presence sensor (LD2410B)` (`CONFIG_OTL_PRESENCE_SENSOR`)
-- `Radar detection` submenu (distance thresholds, on/off delays, task interval)
-- `Non-overlapping warm/cool PWM` (`CONFIG_OTL_NONOVERLAP_PWM`)
-- `Enable circadian color temperature (WiFi + SNTP)` (`CONFIG_OTL_CIRCADIAN_ENABLE`)
+Default behavior:
+- `sdkconfig.defaults` is an offline baseline
+- Wi-Fi is off by default
+- Home Assistant MQTT is off by default
+- HomeKit is off by default
+- circadian is off by default
 
-Circadian notes:
-- Set `WiFi SSID`, `WiFi Password`, and a POSIX `Timezone` string (examples: `PST8PDT,M3.2.0/2,M11.1.0/2`, `EST5EDT,M3.2.0/2,M11.1.0/2`, `UTC0`).
-- Set both `Coolest time (HH:MM)` and `Warmest time (HH:MM)` to shape when the color temperature reaches each extreme (for example `09:00` and `19:30`).
-- The firmware syncs time via SNTP and updates the warm/cool mix smoothly across the day.
-- When enabled, the temperature touch buttons act as a user offset on top of the circadian schedule.
+That means a default build stays simple and local-only unless you explicitly
+turn connected features on.
 
-Notes:
-- This firmware mirrors the Arduino sketch and is a structured starting point.
-  Verify pin mapping and touch thresholds for your specific board.
+### Menuconfig areas
 
-### ESPHome (Home Assistant)
+Under `Open Task Light`, the important sections are:
+
+- `Serial logging`
+  - app logs, periodic status, touch logs, calibration logs, PWM logs
+- `Connectivity`
+  - `Enable WiFi`
+  - `Enable Home Assistant via MQTT`
+  - `Enable Apple Home via HomeKit`
+- `Presence sensor`
+  - LD2410B enable, distance thresholds, on/off delay, polling interval
+- `PWM`
+  - non-overlapping warm/cool PWM
+- `Circadian lighting`
+  - Wi-Fi/SNTP-based circadian schedule and compile-time defaults
+
+### Connectivity
+
+The native firmware uses a shared Wi-Fi subsystem in `components/otl_net/`.
+MQTT, HomeKit, and circadian all sit on top of that and are only compiled when
+enabled.
+
+Wi-Fi notes:
+- Wi-Fi credentials are compile-time settings in `menuconfig`
+- MQTT and HomeKit wait for Wi-Fi to connect before starting
+- if Wi-Fi is disabled, none of the network stacks are initialized
+
+### Home Assistant via MQTT
+
+Enable in `menuconfig`:
+- `Enable WiFi`
+- `Enable Home Assistant via MQTT`
+
+Then set:
+- `MQTT broker URI`
+- `MQTT username` and `MQTT password` if your broker requires auth
+- optional discovery prefix, topic base, and device name
+
+The firmware publishes a native Home Assistant MQTT device with:
+
+- light entity
+  - on/off
+  - brightness
+  - color temperature
+- occupancy binary sensor when presence is enabled
+- telemetry and diagnostics
+  - ambient lux
+  - LED NTC temperature
+  - ESP32-S3 internal temperature
+  - thermal max brightness cap
+  - thermal-limited status
+  - Wi-Fi RSSI
+  - last event
+- runtime controls
+  - LED thermal limit
+  - firmware circadian enable
+  - firmware circadian coolest time
+  - firmware circadian warmest time
+  - verbose diagnostics
+
+Important behavior:
+- the light state stays synchronized across touch, MQTT, presence behavior, and
+  HomeKit when multiple integrations are enabled
+- firmware circadian is runtime-toggleable from Home Assistant so it does not
+  have to fight Adaptive Lighting or your own automations
+- the MQTT integration also publishes a structured event stream and a `Last Event`
+  text sensor instead of mirroring raw serial logs
+
+### Apple Home via HomeKit
+
+Enable in `menuconfig`:
+- `Enable WiFi`
+- `Enable Apple Home via HomeKit`
+
+Then set:
+- `Accessory name`
+- `Setup code`
+- `Setup ID`
+
+Pairing flow:
+1. enter Wi-Fi credentials in `menuconfig`
+2. build and flash the firmware
+3. boot the light onto Wi-Fi
+4. pair it in Apple Home using the configured setup code
+
+Default development values:
+- setup code: `111-22-333`
+- setup ID: `OTL1`
+
+Change those before handing a build to anyone else.
+
+Current HomeKit surface:
+- Lightbulb service
+  - on/off
+  - brightness
+  - color temperature
+- Occupancy Sensor service when presence is enabled
+
+HomeKit intentionally stays narrower than Home Assistant. Diagnostics and
+runtime tuning are exposed through MQTT/HA, not Apple Home.
+
+### Circadian lighting
+
+Enable in `menuconfig`:
+- `Enable WiFi`
+- `Enable circadian color temperature (WiFi + SNTP)`
+
+Compile-time circadian settings:
+- `Timezone (POSIX TZ string)`
+- `SNTP server`
+- `Update interval`
+- `Coolest time (HH:MM)`
+- `Warmest time (HH:MM)`
+- `Minimum cool ratio (%)`
+- `Maximum cool ratio (%)`
+
+Runtime behavior:
+- the circadian engine computes a base warm/cool mix across the day
+- temperature touch controls act as a user offset on top of that base
+- if MQTT is enabled, Home Assistant can turn firmware circadian on or off at runtime
+- if you want Home Assistant to own color temperature policy, disable firmware
+  circadian and use your own automations or Adaptive Lighting
+
+## Local Configuration Profiles
+
+If you keep local config fragments outside Git, use:
+
+```sh
+./tools/use-local-profile.sh prod
+./tools/use-local-profile.sh debug
+```
+
+That rebuilds `sdkconfig` from:
+1. `sdkconfig.defaults`
+2. `sdkconfig.local.shared`
+3. `sdkconfig.local.<profile>`
+
+See `local-config-profiles.md` for the expected pattern.
+
+## ESPHome
+
 Config: `esphome/open-task-light.yaml`
 
 Quick start:
+
 ```sh
 cp esphome/secrets.example.yaml esphome/secrets.yaml
 esphome run esphome/open-task-light.yaml
@@ -61,13 +251,13 @@ esphome run esphome/open-task-light.yaml
 
 Notes:
 - `esphome/secrets.yaml` is intentionally ignored; keep your real Wi-Fi
-  credentials there.
-- Set `wifi.power_save_mode: none` to reduce command latency.
-- Set `logger.baud_rate: 0` to disable serial logs (use `115200` for debugging).
-- Use `use_address` if mDNS is unreliable in your network.
-- Optional: uncomment the LD2410B section in the YAML to enable presence sensing.
+  credentials there
+- this path still exists for people who want an ESPHome-based build
+- the native ESP-IDF firmware is the preferred path if you want the full touch
+  behavior implemented in this repo
 
-### Arduino
+## Arduino
+
 Sketch: `arduino/otl/otl.ino`
 
 Optional radar test sketch: `arduino/LD2410B.ino`
@@ -77,7 +267,7 @@ Quick start:
 2. Select an ESP32-S3 board and install the `Adafruit NeoPixel` library.
 3. Build and upload.
 
-## Default pin map
+## Default Pin Map
 
 | Function | GPIO | Notes |
 | --- | --- | --- |
@@ -97,12 +287,14 @@ Quick start:
 
 Adjust pins to match your board wiring as needed.
 
-## Repo layout
+## Repo Layout
 
 - `arduino/` Arduino sketches
-- `components/` ESP-IDF reusable components such as the circadian controller
+- `components/esp-homekit-sdk/` vendored HomeKit SDK
+- `components/otl_circadian/` shared circadian controller
+- `components/otl_net/` shared Wi-Fi subsystem
 - `esphome/` ESPHome configuration
 - `managed_components/` ESP-IDF managed dependencies
 - `main/` ESP-IDF firmware
 - `sdkconfig.defaults` checked-in ESP-IDF defaults
-- `tools/` helper scripts such as the PWM scope watcher
+- `tools/` helper scripts such as the local profile switcher and PWM scope watcher

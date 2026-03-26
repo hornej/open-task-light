@@ -71,6 +71,107 @@ endmenu
 
 endmenu
 
+menu "Connectivity"
+
+config OTL_WIFI_ENABLE
+    bool "Enable WiFi"
+    default n
+    help
+        Enables the shared WiFi station subsystem used by circadian lighting,
+        Home Assistant MQTT integration, and Apple Home/HomeKit support.
+
+menu "WiFi settings"
+    depends on OTL_WIFI_ENABLE
+
+config OTL_WIFI_SSID
+    string "WiFi SSID"
+    default ""
+
+config OTL_WIFI_PASSWORD
+    string "WiFi Password"
+    default ""
+
+config OTL_WIFI_HOSTNAME
+    string "WiFi hostname"
+    default "open-task-light"
+    help
+        Optional hostname advertised on the local network for this device.
+
+endmenu
+
+config OTL_HA_MQTT_ENABLE
+    bool "Enable Home Assistant via MQTT"
+    depends on OTL_WIFI_ENABLE
+    default n
+    help
+        Publishes Home Assistant MQTT discovery, state, and command topics for
+        native integration without ESPHome.
+
+config OTL_HA_MQTT_DEP_ENABLE
+    int
+    default 1 if OTL_HA_MQTT_ENABLE
+    default 0
+
+menu "Home Assistant MQTT settings"
+    depends on OTL_HA_MQTT_ENABLE
+
+config OTL_MQTT_BROKER_URI
+    string "MQTT broker URI"
+    default "mqtt://homeassistant.local"
+
+config OTL_MQTT_USERNAME
+    string "MQTT username"
+    default ""
+
+config OTL_MQTT_PASSWORD
+    string "MQTT password"
+    default ""
+
+config OTL_MQTT_DISCOVERY_PREFIX
+    string "Home Assistant discovery prefix"
+    default "homeassistant"
+
+config OTL_MQTT_TOPIC_BASE
+    string "MQTT topic base"
+    default "open-task-light"
+
+config OTL_MQTT_DEVICE_NAME
+    string "MQTT device name"
+    default "Open Task Light"
+
+endmenu
+
+config OTL_HOMEKIT_ENABLE
+    bool "Enable Apple Home via HomeKit"
+    depends on OTL_WIFI_ENABLE
+    default n
+    help
+        Exposes the light as a native Apple Home accessory using Espressif's
+        HomeKit SDK.
+
+menu "HomeKit settings"
+    depends on OTL_HOMEKIT_ENABLE
+
+config OTL_HOMEKIT_ACCESSORY_NAME
+    string "Accessory name"
+    default "Open Task Light"
+
+config OTL_HOMEKIT_SETUP_CODE
+    string "Setup code"
+    default "111-22-333"
+    help
+        Apple Home pairing code in XXX-XX-XXX format.
+
+config OTL_HOMEKIT_SETUP_ID
+    string "Setup ID"
+    default "OTL1"
+    help
+        Four-character setup ID used when generating the pairing payload.
+
+endmenu
+
+endmenu
+
 menu "Presence sensor"
 
 config OTL_PRESENCE_SENSOR
@@ -155,6 +256,7 @@ menu "Circadian lighting"
 
 config OTL_CIRCADIAN_ENABLE
     bool "Enable circadian color temperature (WiFi + SNTP)"
+    depends on OTL_WIFI_ENABLE
     default n
     help
         Connects to WiFi, syncs local time via SNTP, and continuously updates
@@ -163,14 +265,6 @@ config OTL_CIRCADIAN_ENABLE
 
 menu "Circadian settings"
     depends on OTL_CIRCADIAN_ENABLE
-
-config OTL_WIFI_SSID
-    string "WiFi SSID"
-    default ""
-
-config OTL_WIFI_PASSWORD
-    string "WiFi Password"
-    default ""
 
 config OTL_TIMEZONE
     string "Timezone (POSIX TZ string)"

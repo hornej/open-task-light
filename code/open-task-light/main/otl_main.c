@@ -5,13 +5,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
-#include <string.h>     
+#include <string.h>
 #include <time.h>
 #include "sdkconfig.h"
 #include "esp_idf_version.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "esp_check.h"
 #include "esp_log.h"
 #if CONFIG_OTL_SERIAL_OUTPUT
 #define OTL_LOGI(tag, fmt, ...) ESP_LOGI(tag, fmt, ##__VA_ARGS__)
@@ -54,7 +55,6 @@
 #define OTL_LOG_RADARI(fmt, ...) do { (void)(fmt); } while (0)
 #endif
 
-#if CONFIG_OTL_SERIAL_OUTPUT
 static const char *otl_log_localtime(char *buf, size_t buf_len) __attribute__((unused));
 static const char *otl_log_localtime(char *buf, size_t buf_len)
 {
@@ -78,8 +78,8 @@ static const char *otl_log_localtime(char *buf, size_t buf_len)
 
     return buf;
 }
-#endif
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "driver/ledc.h"
 #include "driver/touch_pad.h"
 #include "esp_adc/adc_oneshot.h"
@@ -93,7 +93,13 @@ static const char *otl_log_localtime(char *buf, size_t buf_len)
 #include "esp_adc/adc_cali_scheme.h"
 #include "freertos/queue.h"
 #include "esp_intr_alloc.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 #include "otl_circadian.h"
+#include "otl_homekit.h"
+#include "otl_mqtt.h"
+#include "otl_net.h"
+#include "otl_runtime.h"
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0)
 #define OTL_ADC_ATTEN ADC_ATTEN_DB_12
@@ -576,9 +582,20 @@ static float brightness_percent = 50.0f; // 1 … 100
 static float temp_ratio         = 0.5f;  // 0.0 warm … 1.0 cool
 
 #if CONFIG_OTL_CIRCADIAN_ENABLE
+#define OTL_RUNTIME_DEFAULT_CIRCADIAN_ENABLED true
+#define OTL_RUNTIME_DEFAULT_CIRCADIAN_COOLEST_TIME CONFIG_OTL_CIRCADIAN_COOLEST_TIME
+#define OTL_RUNTIME_DEFAULT_CIRCADIAN_WARMEST_TIME CONFIG_OTL_CIRCADIAN_WARMEST_TIME
 static float circadian_base_ratio = 0.5f;     // 0.0 warm .. 1.0 cool
 static float temp_ratio_user_offset = 0.0f;   // applied on top of circadian_base_ratio
+#else
+#define OTL_RUNTIME_DEFAULT_CIRCADIAN_ENABLED false
+#define OTL_RUNTIME_DEFAULT_CIRCADIAN_COOLEST_TIME "11:00"
+#define OTL_RUNTIME_DEFAULT_CIRCADIAN_WARMEST_TIME "23:00"
 #endif
+static bool runtime_circadian_enabled = OTL_RUNTIME_DEFAULT_CIRCADIAN_ENABLED;
+static char runtime_circadian_coolest_time[OTL_RUNTIME_TIME_STR_LEN] = OTL_RUNTIME_DEFAULT_CIRCADIAN_COOLEST_TIME;
+static char runtime_circadian_warmest_time[OTL_RUNTIME_TIME_STR_LEN] = OTL_RUNTIME_DEFAULT_CIRCADIAN_WARMEST_TIME;
+static bool runtime_verbose_diagnostics_enabled = false;
 
 static const int   BRIGHT_STEP      = 1;
 static const float TEMP_STEP        = 0.015f;
@@ -588,6 +605,7 @@ static const float GAMMA_CORRECTION = 1.6f;
 // Limit maximum brightness to avoid overheating
 static const int   MAX_BRIGHTNESS_PERCENT = 95;
 static const float MIN_BRIGHTNESS_PERCENT = 5.0f;
+static const float MIN_BRIGHTNESS_HOLD_EPSILON_PERCENT = 0.5f;
 
 // ---------------------------- Thermal protection ------------------------------
 // If either sensor crosses the "hot" threshold, clamp the *effective* maximum
@@ -599,11 +617,14 @@ static const float MIN_BRIGHTNESS_PERCENT = 5.0f;
 #define OTL_THERMAL_DIM_MAX_BRIGHTNESS_PERCENT   30.0f
 #define OTL_THERMAL_NTC_HOT_CONFIRM_POLLS        2
 #define OTL_NTC_SAMPLE_COUNT                     5
+#define OTL_RUNTIME_LED_THERM_LIMIT_MIN_C        60.0f
+#define OTL_RUNTIME_LED_THERM_LIMIT_MAX_C        110.0f
 
 static volatile bool thermal_ntc_hot = false;
 static volatile bool thermal_chip_hot = false;
 static volatile float thermal_brightness_cap_percent = 100.0f;
 static uint8_t thermal_ntc_hot_confirm_polls = 0;
+static float runtime_led_thermal_limit_c = OTL_THERMAL_NTC_HOT_C;
 // While holding dim-down, allow a deeper range below the normal minimum.
 // HOLD_MIN_BRIGHTNESS_PERCENT is the internal floor used for holds; the mapping
 // below converts that to a physical PWM duty floor (HOLD_MIN_PWM_DUTY_RATIO).
@@ -625,8 +646,19 @@ static uint32_t pwm_hold_current_total_duty = 0;
 #if CONFIG_OTL_SERIAL_OUTPUT && CONFIG_OTL_LOG_PWM_DUTY
 static esp_timer_handle_t pwm_log_timer = NULL;
 #endif
+static SemaphoreHandle_t otl_state_mutex = NULL;
+static bool radar_presence = false;
+static float telemetry_ambient_lux = NAN;
+static float telemetry_ntc_temp_c = NAN;
+static float telemetry_chip_temp_c = NAN;
+static bool telemetry_wifi_connected = false;
+static int telemetry_wifi_rssi_dbm = 0;
 
 static inline float clampf(float v, float lo, float hi);
+static esp_err_t otl_runtime_settings_init(void);
+static bool otl_runtime_parse_hhmm_seconds(const char *value, int *seconds_out);
+static void otl_runtime_store_defaults_locked(void);
+static void thermal_update(float ntc_c, float chip_c);
 
 #if CONFIG_OTL_CIRCADIAN_ENABLE
 static void circadian_apply_current_ratio(void)
@@ -635,7 +667,9 @@ static void circadian_apply_current_ratio(void)
     float min_offset = -circadian_base_ratio;
     float max_offset = 1.0f - circadian_base_ratio;
     temp_ratio_user_offset = clampf(temp_ratio_user_offset, min_offset, max_offset);
-    temp_ratio = clampf(circadian_base_ratio + temp_ratio_user_offset, 0.0f, 1.0f);
+    if (runtime_circadian_enabled) {
+        temp_ratio = clampf(circadian_base_ratio + temp_ratio_user_offset, 0.0f, 1.0f);
+    }
 }
 #endif
 
@@ -643,20 +677,14 @@ static void otl_set_temp_ratio(float ratio)
 {
     ratio = clampf(ratio, 0.0f, 1.0f);
 #if CONFIG_OTL_CIRCADIAN_ENABLE
-    temp_ratio_user_offset = ratio - circadian_base_ratio;
-    circadian_apply_current_ratio();
+    if (runtime_circadian_enabled) {
+        temp_ratio_user_offset = ratio - circadian_base_ratio;
+        circadian_apply_current_ratio();
+    } else {
+        temp_ratio = ratio;
+    }
 #else
     temp_ratio = ratio;
-#endif
-}
-
-static void otl_adjust_temp_ratio(float delta)
-{
-#if CONFIG_OTL_CIRCADIAN_ENABLE
-    temp_ratio_user_offset += delta;
-    circadian_apply_current_ratio();
-#else
-    temp_ratio = clampf(temp_ratio + delta, 0.0f, 1.0f);
 #endif
 }
 
@@ -879,13 +907,8 @@ static bool radar_occupied        = false;
 static bool occupancy_faded_out   = false;
 static bool saved_led_state       = false;
 static int  saved_brightness      = 0;
-#if CONFIG_OTL_CIRCADIAN_ENABLE
 static float saved_temp_ratio_offset = 0.0f;
-#else
 static float saved_temp_ratio     = 0.5f;
-#endif
-// Presence as determined from radar UART + OUT pin
-static bool radar_presence        = false;
 // Detection and hysteresis tuning from menuconfig -> Open Task Light -> Radar detection.
 #define RADAR_MOVING_NEAR_MAX_CM      ((uint16_t)CONFIG_OTL_RADAR_MOVING_MAX_DISTANCE_CM)
 #define RADAR_PRESENCE_MAX_DIST_CM    ((uint16_t)CONFIG_OTL_RADAR_STATIONARY_MAX_DISTANCE_CM)
@@ -1204,14 +1227,930 @@ static void ws2812_set_rgb(uint8_t r, uint8_t g, uint8_t b)
 // Forward declaration so occupancy helpers can call it.
 static void update_outputs(void);
 
+#define OTL_MAX_STATE_LISTENERS     4
+#define OTL_MAX_TELEMETRY_LISTENERS 4
+#define OTL_MAX_SETTINGS_LISTENERS  4
+#define OTL_MAX_EVENT_LISTENERS     4
+#define OTL_RUNTIME_SETTINGS_NAMESPACE "otl_runtime"
+#define OTL_RUNTIME_KEY_CIRCADIAN_ENABLED "circ_en"
+#define OTL_RUNTIME_KEY_CIRCADIAN_COOL    "circ_cool"
+#define OTL_RUNTIME_KEY_CIRCADIAN_WARM    "circ_warm"
+#define OTL_RUNTIME_KEY_LED_THERM_LIMIT   "led_tmax"
+#define OTL_RUNTIME_KEY_VERBOSE_DIAG      "diag_verbose"
+
+typedef struct {
+    otl_state_listener_fn listener;
+    void *ctx;
+} otl_state_listener_entry_t;
+
+typedef struct {
+    otl_telemetry_listener_fn listener;
+    void *ctx;
+} otl_telemetry_listener_entry_t;
+
+typedef struct {
+    otl_runtime_settings_listener_fn listener;
+    void *ctx;
+} otl_runtime_settings_listener_entry_t;
+
+typedef struct {
+    otl_event_listener_fn listener;
+    void *ctx;
+} otl_event_listener_entry_t;
+
+static otl_state_listener_entry_t otl_state_listeners[OTL_MAX_STATE_LISTENERS];
+static otl_telemetry_listener_entry_t otl_telemetry_listeners[OTL_MAX_TELEMETRY_LISTENERS];
+static otl_runtime_settings_listener_entry_t otl_runtime_settings_listeners[OTL_MAX_SETTINGS_LISTENERS];
+static otl_event_listener_entry_t otl_event_listeners[OTL_MAX_EVENT_LISTENERS];
+static otl_runtime_event_t s_last_event = {
+    .timestamp = "time=unset",
+    .level = OTL_EVENT_LEVEL_INFO,
+    .category = "system",
+    .message = "Booting",
+};
+
+static void otl_state_lock(void)
+{
+    xSemaphoreTake(otl_state_mutex, portMAX_DELAY);
+}
+
+static void otl_state_unlock(void)
+{
+    xSemaphoreGive(otl_state_mutex);
+}
+
+static bool otl_state_float_changed(float a, float b)
+{
+    return fabsf(a - b) > 0.0005f;
+}
+
+static bool otl_runtime_float_changed(float a, float b, float epsilon)
+{
+    if (isnan(a) && isnan(b)) {
+        return false;
+    }
+    if (isnan(a) != isnan(b)) {
+        return true;
+    }
+    return fabsf(a - b) > epsilon;
+}
+
+static void otl_state_snapshot_locked(otl_public_state_t *state)
+{
+    if (state == NULL) {
+        return;
+    }
+
+    state->is_on = led_state;
+    state->brightness_percent = brightness_percent;
+    state->temp_ratio = temp_ratio;
+    state->presence = radar_presence;
+}
+
+static void otl_telemetry_snapshot_locked(otl_telemetry_t *telemetry)
+{
+    if (telemetry == NULL) {
+        return;
+    }
+
+    telemetry->ambient_lux = telemetry_ambient_lux;
+    telemetry->ntc_temp_c = telemetry_ntc_temp_c;
+    telemetry->chip_temp_c = telemetry_chip_temp_c;
+    telemetry->thermal_brightness_cap_percent = thermal_brightness_cap_percent;
+    telemetry->thermal_limited = thermal_ntc_hot || thermal_chip_hot;
+    telemetry->thermal_ntc_hot = thermal_ntc_hot;
+    telemetry->thermal_chip_hot = thermal_chip_hot;
+    telemetry->wifi_connected = telemetry_wifi_connected;
+    telemetry->wifi_rssi_dbm = telemetry_wifi_rssi_dbm;
+}
+
+static void otl_runtime_settings_snapshot_locked(otl_runtime_settings_t *settings)
+{
+    if (settings == NULL) {
+        return;
+    }
+
+    settings->circadian_enabled = runtime_circadian_enabled;
+    snprintf(settings->circadian_coolest_time,
+             sizeof(settings->circadian_coolest_time),
+             "%s",
+             runtime_circadian_coolest_time);
+    snprintf(settings->circadian_warmest_time,
+             sizeof(settings->circadian_warmest_time),
+             "%s",
+             runtime_circadian_warmest_time);
+    settings->led_thermal_limit_c = runtime_led_thermal_limit_c;
+    settings->verbose_diagnostics_enabled = runtime_verbose_diagnostics_enabled;
+}
+
+static void otl_event_snapshot_locked(otl_runtime_event_t *event)
+{
+    if (event == NULL) {
+        return;
+    }
+
+    *event = s_last_event;
+}
+
+static void otl_state_notify_listeners(const otl_public_state_t *state,
+                                       otl_change_source_t source)
+{
+    otl_state_listener_entry_t listeners[OTL_MAX_STATE_LISTENERS] = {0};
+    size_t listener_count = 0;
+
+    otl_state_lock();
+    for (size_t i = 0; i < OTL_MAX_STATE_LISTENERS; ++i) {
+        if (otl_state_listeners[i].listener == NULL) {
+            continue;
+        }
+        listeners[listener_count++] = otl_state_listeners[i];
+    }
+    otl_state_unlock();
+
+    for (size_t i = 0; i < listener_count; ++i) {
+        listeners[i].listener(state, source, listeners[i].ctx);
+    }
+}
+
+static void otl_telemetry_notify_listeners(const otl_telemetry_t *telemetry)
+{
+    otl_telemetry_listener_entry_t listeners[OTL_MAX_TELEMETRY_LISTENERS] = {0};
+    size_t listener_count = 0;
+
+    otl_state_lock();
+    for (size_t i = 0; i < OTL_MAX_TELEMETRY_LISTENERS; ++i) {
+        if (otl_telemetry_listeners[i].listener == NULL) {
+            continue;
+        }
+        listeners[listener_count++] = otl_telemetry_listeners[i];
+    }
+    otl_state_unlock();
+
+    for (size_t i = 0; i < listener_count; ++i) {
+        listeners[i].listener(telemetry, listeners[i].ctx);
+    }
+}
+
+static void otl_runtime_settings_notify_listeners(const otl_runtime_settings_t *settings,
+                                                  otl_change_source_t source)
+{
+    otl_runtime_settings_listener_entry_t listeners[OTL_MAX_SETTINGS_LISTENERS] = {0};
+    size_t listener_count = 0;
+
+    otl_state_lock();
+    for (size_t i = 0; i < OTL_MAX_SETTINGS_LISTENERS; ++i) {
+        if (otl_runtime_settings_listeners[i].listener == NULL) {
+            continue;
+        }
+        listeners[listener_count++] = otl_runtime_settings_listeners[i];
+    }
+    otl_state_unlock();
+
+    for (size_t i = 0; i < listener_count; ++i) {
+        listeners[i].listener(settings, source, listeners[i].ctx);
+    }
+}
+
+static void otl_event_notify_listeners(const otl_runtime_event_t *event)
+{
+    otl_event_listener_entry_t listeners[OTL_MAX_EVENT_LISTENERS] = {0};
+    size_t listener_count = 0;
+
+    otl_state_lock();
+    for (size_t i = 0; i < OTL_MAX_EVENT_LISTENERS; ++i) {
+        if (otl_event_listeners[i].listener == NULL) {
+            continue;
+        }
+        listeners[listener_count++] = otl_event_listeners[i];
+    }
+    otl_state_unlock();
+
+    for (size_t i = 0; i < listener_count; ++i) {
+        listeners[i].listener(event, listeners[i].ctx);
+    }
+}
+
+static bool otl_runtime_parse_hhmm_seconds(const char *value, int *seconds_out)
+{
+    if (value == NULL || seconds_out == NULL) {
+        return false;
+    }
+
+    int hour = 0;
+    int minute = 0;
+    if (strlen(value) != 5 || value[2] != ':') {
+        return false;
+    }
+    if (sscanf(value, "%2d:%2d", &hour, &minute) != 2) {
+        return false;
+    }
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+        return false;
+    }
+
+    *seconds_out = (hour * 3600) + (minute * 60);
+    return true;
+}
+
+static void otl_runtime_store_defaults_locked(void)
+{
+    runtime_circadian_enabled = OTL_RUNTIME_DEFAULT_CIRCADIAN_ENABLED;
+    snprintf(runtime_circadian_coolest_time,
+             sizeof(runtime_circadian_coolest_time),
+             "%s",
+             OTL_RUNTIME_DEFAULT_CIRCADIAN_COOLEST_TIME);
+    snprintf(runtime_circadian_warmest_time,
+             sizeof(runtime_circadian_warmest_time),
+             "%s",
+             OTL_RUNTIME_DEFAULT_CIRCADIAN_WARMEST_TIME);
+    runtime_led_thermal_limit_c = OTL_THERMAL_NTC_HOT_C;
+    runtime_verbose_diagnostics_enabled = false;
+}
+
+static esp_err_t otl_runtime_nvs_init(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    if (err == ESP_ERR_INVALID_STATE) {
+        return ESP_OK;
+    }
+    return err;
+}
+
+static esp_err_t otl_runtime_save_u8(const char *key, uint8_t value)
+{
+    nvs_handle_t handle = 0;
+    esp_err_t err = otl_runtime_nvs_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_open(OTL_RUNTIME_SETTINGS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_set_u8(handle, key, value);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err;
+}
+
+static esp_err_t otl_runtime_save_u16(const char *key, uint16_t value)
+{
+    nvs_handle_t handle = 0;
+    esp_err_t err = otl_runtime_nvs_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_open(OTL_RUNTIME_SETTINGS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_set_u16(handle, key, value);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err;
+}
+
+static esp_err_t otl_runtime_save_str(const char *key, const char *value)
+{
+    nvs_handle_t handle = 0;
+    esp_err_t err = otl_runtime_nvs_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_open(OTL_RUNTIME_SETTINGS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_set_str(handle, key, value);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err;
+}
+
+static esp_err_t otl_runtime_settings_init(void)
+{
+    bool circadian_enabled = OTL_RUNTIME_DEFAULT_CIRCADIAN_ENABLED;
+    bool verbose_enabled = false;
+    float led_thermal_limit_c = OTL_THERMAL_NTC_HOT_C;
+    char coolest_time[OTL_RUNTIME_TIME_STR_LEN] = OTL_RUNTIME_DEFAULT_CIRCADIAN_COOLEST_TIME;
+    char warmest_time[OTL_RUNTIME_TIME_STR_LEN] = OTL_RUNTIME_DEFAULT_CIRCADIAN_WARMEST_TIME;
+    uint8_t stored_u8 = 0;
+    uint16_t stored_u16 = 0;
+    char stored_time[OTL_RUNTIME_TIME_STR_LEN] = {0};
+    size_t stored_len = 0;
+    nvs_handle_t handle = 0;
+    esp_err_t err = ESP_OK;
+
+    err = otl_runtime_nvs_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_open(OTL_RUNTIME_SETTINGS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_OK) {
+#if CONFIG_OTL_CIRCADIAN_ENABLE
+        if (nvs_get_u8(handle, OTL_RUNTIME_KEY_CIRCADIAN_ENABLED, &stored_u8) == ESP_OK) {
+            circadian_enabled = (stored_u8 != 0);
+        }
+
+        stored_len = sizeof(stored_time);
+        memset(stored_time, 0, sizeof(stored_time));
+        if (nvs_get_str(handle, OTL_RUNTIME_KEY_CIRCADIAN_COOL, stored_time, &stored_len) == ESP_OK &&
+            otl_runtime_parse_hhmm_seconds(stored_time, &(int){0})) {
+            snprintf(coolest_time, sizeof(coolest_time), "%s", stored_time);
+        }
+
+        stored_len = sizeof(stored_time);
+        memset(stored_time, 0, sizeof(stored_time));
+        if (nvs_get_str(handle, OTL_RUNTIME_KEY_CIRCADIAN_WARM, stored_time, &stored_len) == ESP_OK &&
+            otl_runtime_parse_hhmm_seconds(stored_time, &(int){0})) {
+            snprintf(warmest_time, sizeof(warmest_time), "%s", stored_time);
+        }
+#endif
+        if (nvs_get_u8(handle, OTL_RUNTIME_KEY_VERBOSE_DIAG, &stored_u8) == ESP_OK) {
+            verbose_enabled = (stored_u8 != 0);
+        }
+        if (nvs_get_u16(handle, OTL_RUNTIME_KEY_LED_THERM_LIMIT, &stored_u16) == ESP_OK) {
+            float stored_limit = (float)stored_u16 / 10.0f;
+            if (stored_limit >= OTL_RUNTIME_LED_THERM_LIMIT_MIN_C &&
+                stored_limit <= OTL_RUNTIME_LED_THERM_LIMIT_MAX_C) {
+                led_thermal_limit_c = stored_limit;
+            }
+        }
+        nvs_close(handle);
+    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+        return err;
+    }
+
+    otl_state_lock();
+    otl_runtime_store_defaults_locked();
+#if CONFIG_OTL_CIRCADIAN_ENABLE
+    runtime_circadian_enabled = circadian_enabled;
+    snprintf(runtime_circadian_coolest_time, sizeof(runtime_circadian_coolest_time), "%s", coolest_time);
+    snprintf(runtime_circadian_warmest_time, sizeof(runtime_circadian_warmest_time), "%s", warmest_time);
+#endif
+    runtime_led_thermal_limit_c = led_thermal_limit_c;
+    runtime_verbose_diagnostics_enabled = verbose_enabled;
+    otl_state_unlock();
+
+    return ESP_OK;
+}
+
+void otl_state_get_public(otl_public_state_t *state)
+{
+    if (state == NULL) {
+        return;
+    }
+
+    otl_state_lock();
+    otl_state_snapshot_locked(state);
+    otl_state_unlock();
+}
+
+void otl_telemetry_get_public(otl_telemetry_t *telemetry)
+{
+    if (telemetry == NULL) {
+        return;
+    }
+
+    otl_state_lock();
+    otl_telemetry_snapshot_locked(telemetry);
+    otl_state_unlock();
+}
+
+void otl_runtime_settings_get(otl_runtime_settings_t *settings)
+{
+    if (settings == NULL) {
+        return;
+    }
+
+    otl_state_lock();
+    otl_runtime_settings_snapshot_locked(settings);
+    otl_state_unlock();
+}
+
+void otl_event_get_last(otl_runtime_event_t *event)
+{
+    if (event == NULL) {
+        return;
+    }
+
+    otl_state_lock();
+    otl_event_snapshot_locked(event);
+    otl_state_unlock();
+}
+
+bool otl_state_apply_light_update(const otl_light_update_t *update,
+                                  otl_change_source_t source)
+{
+    bool changed = false;
+    otl_public_state_t state = {0};
+
+    if (update == NULL) {
+        return false;
+    }
+
+    otl_state_lock();
+
+    if (update->set_power && led_state != update->power_on) {
+        changed = true;
+        led_state = update->power_on;
+    }
+
+    if (update->set_brightness) {
+        float new_brightness = clampf(update->brightness_percent,
+                                      HOLD_MIN_BRIGHTNESS_PERCENT,
+                                      (float)MAX_BRIGHTNESS_PERCENT);
+        if (otl_state_float_changed(brightness_percent, new_brightness)) {
+            changed = true;
+            brightness_percent = new_brightness;
+        }
+        if (update->force_on_with_brightness && !led_state) {
+            changed = true;
+            led_state = true;
+        }
+    }
+
+    if (update->set_temp_ratio) {
+        float prev_temp_ratio = temp_ratio;
+        otl_set_temp_ratio(update->temp_ratio);
+        if (otl_state_float_changed(prev_temp_ratio, temp_ratio)) {
+            changed = true;
+        }
+    }
+
+    if (!changed) {
+        otl_state_unlock();
+        return false;
+    }
+
+    update_outputs();
+    otl_state_snapshot_locked(&state);
+    otl_state_unlock();
+    otl_state_notify_listeners(&state, source);
+    return true;
+}
+
+bool otl_state_set_presence(bool presence, otl_change_source_t source)
+{
+    bool changed = false;
+    otl_public_state_t state = {0};
+
+    otl_state_lock();
+    if (radar_presence != presence) {
+        radar_presence = presence;
+        changed = true;
+        otl_state_snapshot_locked(&state);
+    }
+    otl_state_unlock();
+
+    if (changed) {
+        otl_state_notify_listeners(&state, source);
+        otl_event_emit(OTL_EVENT_LEVEL_INFO,
+                       "occupancy",
+                       presence ? "Occupancy detected" : "Occupancy cleared");
+    }
+
+    return changed;
+}
+
+esp_err_t otl_state_add_listener(otl_state_listener_fn listener, void *ctx)
+{
+    if (listener == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    otl_state_lock();
+    for (size_t i = 0; i < OTL_MAX_STATE_LISTENERS; ++i) {
+        if (otl_state_listeners[i].listener != NULL) {
+            continue;
+        }
+        otl_state_listeners[i].listener = listener;
+        otl_state_listeners[i].ctx = ctx;
+        otl_state_unlock();
+        return ESP_OK;
+    }
+    otl_state_unlock();
+    return ESP_ERR_NO_MEM;
+}
+
+esp_err_t otl_telemetry_add_listener(otl_telemetry_listener_fn listener, void *ctx)
+{
+    if (listener == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    otl_state_lock();
+    for (size_t i = 0; i < OTL_MAX_TELEMETRY_LISTENERS; ++i) {
+        if (otl_telemetry_listeners[i].listener != NULL) {
+            continue;
+        }
+        otl_telemetry_listeners[i].listener = listener;
+        otl_telemetry_listeners[i].ctx = ctx;
+        otl_state_unlock();
+        return ESP_OK;
+    }
+    otl_state_unlock();
+    return ESP_ERR_NO_MEM;
+}
+
+esp_err_t otl_runtime_settings_add_listener(otl_runtime_settings_listener_fn listener, void *ctx)
+{
+    if (listener == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    otl_state_lock();
+    for (size_t i = 0; i < OTL_MAX_SETTINGS_LISTENERS; ++i) {
+        if (otl_runtime_settings_listeners[i].listener != NULL) {
+            continue;
+        }
+        otl_runtime_settings_listeners[i].listener = listener;
+        otl_runtime_settings_listeners[i].ctx = ctx;
+        otl_state_unlock();
+        return ESP_OK;
+    }
+    otl_state_unlock();
+    return ESP_ERR_NO_MEM;
+}
+
+esp_err_t otl_event_add_listener(otl_event_listener_fn listener, void *ctx)
+{
+    if (listener == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    otl_state_lock();
+    for (size_t i = 0; i < OTL_MAX_EVENT_LISTENERS; ++i) {
+        if (otl_event_listeners[i].listener != NULL) {
+            continue;
+        }
+        otl_event_listeners[i].listener = listener;
+        otl_event_listeners[i].ctx = ctx;
+        otl_state_unlock();
+        return ESP_OK;
+    }
+    otl_state_unlock();
+    return ESP_ERR_NO_MEM;
+}
+
+void otl_state_notify_current(otl_change_source_t source)
+{
+    otl_public_state_t state = {0};
+    otl_state_get_public(&state);
+    otl_state_notify_listeners(&state, source);
+}
+
+void otl_telemetry_notify_current(void)
+{
+    otl_telemetry_t telemetry = {0};
+    otl_telemetry_get_public(&telemetry);
+    otl_telemetry_notify_listeners(&telemetry);
+}
+
+void otl_runtime_settings_notify_current(otl_change_source_t source)
+{
+    otl_runtime_settings_t settings = {0};
+    otl_runtime_settings_get(&settings);
+    otl_runtime_settings_notify_listeners(&settings, source);
+}
+
+void otl_event_notify_current(void)
+{
+    otl_runtime_event_t event = {0};
+    otl_event_get_last(&event);
+    otl_event_notify_listeners(&event);
+}
+
+bool otl_runtime_verbose_diagnostics_enabled(void)
+{
+    bool enabled = false;
+
+    otl_state_lock();
+    enabled = runtime_verbose_diagnostics_enabled;
+    otl_state_unlock();
+    return enabled;
+}
+
+bool otl_runtime_circadian_is_enabled(void)
+{
+#if CONFIG_OTL_CIRCADIAN_ENABLE
+    bool enabled = false;
+
+    otl_state_lock();
+    enabled = runtime_circadian_enabled;
+    otl_state_unlock();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+bool otl_runtime_get_circadian_schedule(int *coolest_seconds, int *warmest_seconds)
+{
+    otl_runtime_settings_t settings = {0};
+    int coolest = 0;
+    int warmest = 0;
+
+    if (coolest_seconds == NULL || warmest_seconds == NULL) {
+        return false;
+    }
+
+    otl_runtime_settings_get(&settings);
+    if (!otl_runtime_parse_hhmm_seconds(settings.circadian_coolest_time, &coolest) ||
+        !otl_runtime_parse_hhmm_seconds(settings.circadian_warmest_time, &warmest)) {
+        return false;
+    }
+
+    *coolest_seconds = coolest;
+    *warmest_seconds = warmest;
+    return true;
+}
+
+esp_err_t otl_runtime_set_verbose_diagnostics(bool enabled, otl_change_source_t source)
+{
+    otl_runtime_settings_t settings = {0};
+
+    ESP_RETURN_ON_ERROR(otl_runtime_save_u8(OTL_RUNTIME_KEY_VERBOSE_DIAG, enabled ? 1U : 0U),
+                        "runtime",
+                        "Failed to save verbose diagnostics setting");
+
+    otl_state_lock();
+    if (runtime_verbose_diagnostics_enabled == enabled) {
+        otl_state_unlock();
+        return ESP_OK;
+    }
+    runtime_verbose_diagnostics_enabled = enabled;
+    otl_runtime_settings_snapshot_locked(&settings);
+    otl_state_unlock();
+
+    otl_runtime_settings_notify_listeners(&settings, source);
+    otl_event_emit(OTL_EVENT_LEVEL_INFO,
+                   "diagnostics",
+                   enabled ? "Verbose diagnostics enabled" : "Verbose diagnostics disabled");
+    return ESP_OK;
+}
+
+esp_err_t otl_runtime_set_circadian_enabled(bool enabled, otl_change_source_t source)
+{
+#if CONFIG_OTL_CIRCADIAN_ENABLE
+    otl_runtime_settings_t settings = {0};
+    otl_public_state_t state = {0};
+    bool state_changed = false;
+
+    ESP_RETURN_ON_ERROR(otl_runtime_save_u8(OTL_RUNTIME_KEY_CIRCADIAN_ENABLED, enabled ? 1U : 0U),
+                        "runtime",
+                        "Failed to save circadian enable setting");
+
+    otl_state_lock();
+    if (runtime_circadian_enabled == enabled) {
+        otl_state_unlock();
+        return ESP_OK;
+    }
+    runtime_circadian_enabled = enabled;
+    if (enabled) {
+        float prev_temp_ratio = temp_ratio;
+        circadian_apply_current_ratio();
+        state_changed = otl_state_float_changed(prev_temp_ratio, temp_ratio);
+        if (state_changed && led_state) {
+            update_outputs();
+        }
+        if (state_changed) {
+            otl_state_snapshot_locked(&state);
+        }
+    }
+    otl_runtime_settings_snapshot_locked(&settings);
+    otl_state_unlock();
+
+    otl_runtime_settings_notify_listeners(&settings, source);
+    if (state_changed) {
+        otl_state_notify_listeners(&state, source);
+    }
+    otl_event_emit(OTL_EVENT_LEVEL_INFO,
+                   "circadian",
+                   enabled ? "Firmware circadian enabled" : "Firmware circadian disabled");
+    return ESP_OK;
+#else
+    (void)enabled;
+    (void)source;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+esp_err_t otl_runtime_set_circadian_coolest_time(const char *hhmm, otl_change_source_t source)
+{
+    otl_runtime_settings_t settings = {0};
+    char event_message[OTL_RUNTIME_EVENT_MESSAGE_LEN] = {0};
+
+    if (!otl_runtime_parse_hhmm_seconds(hhmm, &(int){0})) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_RETURN_ON_ERROR(otl_runtime_save_str(OTL_RUNTIME_KEY_CIRCADIAN_COOL, hhmm),
+                        "runtime",
+                        "Failed to save coolest time");
+
+    otl_state_lock();
+    if (strncmp(runtime_circadian_coolest_time, hhmm, sizeof(runtime_circadian_coolest_time)) == 0) {
+        otl_state_unlock();
+        return ESP_OK;
+    }
+    snprintf(runtime_circadian_coolest_time, sizeof(runtime_circadian_coolest_time), "%s", hhmm);
+    otl_runtime_settings_snapshot_locked(&settings);
+    otl_state_unlock();
+
+    otl_runtime_settings_notify_listeners(&settings, source);
+    snprintf(event_message, sizeof(event_message), "Updated coolest time to %s", hhmm);
+    otl_event_emit(OTL_EVENT_LEVEL_INFO, "circadian", event_message);
+    return ESP_OK;
+}
+
+esp_err_t otl_runtime_set_circadian_warmest_time(const char *hhmm, otl_change_source_t source)
+{
+    otl_runtime_settings_t settings = {0};
+    char event_message[OTL_RUNTIME_EVENT_MESSAGE_LEN] = {0};
+
+    if (!otl_runtime_parse_hhmm_seconds(hhmm, &(int){0})) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_RETURN_ON_ERROR(otl_runtime_save_str(OTL_RUNTIME_KEY_CIRCADIAN_WARM, hhmm),
+                        "runtime",
+                        "Failed to save warmest time");
+
+    otl_state_lock();
+    if (strncmp(runtime_circadian_warmest_time, hhmm, sizeof(runtime_circadian_warmest_time)) == 0) {
+        otl_state_unlock();
+        return ESP_OK;
+    }
+    snprintf(runtime_circadian_warmest_time, sizeof(runtime_circadian_warmest_time), "%s", hhmm);
+    otl_runtime_settings_snapshot_locked(&settings);
+    otl_state_unlock();
+
+    otl_runtime_settings_notify_listeners(&settings, source);
+    snprintf(event_message, sizeof(event_message), "Updated warmest time to %s", hhmm);
+    otl_event_emit(OTL_EVENT_LEVEL_INFO, "circadian", event_message);
+    return ESP_OK;
+}
+
+esp_err_t otl_runtime_set_led_thermal_limit_c(float limit_c, otl_change_source_t source)
+{
+    otl_runtime_settings_t settings = {0};
+    char event_message[OTL_RUNTIME_EVENT_MESSAGE_LEN] = {0};
+    float normalized_limit = roundf(limit_c);
+
+    if (isnan(limit_c) ||
+        normalized_limit < OTL_RUNTIME_LED_THERM_LIMIT_MIN_C ||
+        normalized_limit > OTL_RUNTIME_LED_THERM_LIMIT_MAX_C) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_RETURN_ON_ERROR(otl_runtime_save_u16(OTL_RUNTIME_KEY_LED_THERM_LIMIT,
+                                             (uint16_t)lroundf(normalized_limit * 10.0f)),
+                        "runtime",
+                        "Failed to save LED thermal limit");
+
+    otl_state_lock();
+    if (!otl_runtime_float_changed(runtime_led_thermal_limit_c, normalized_limit, 0.01f)) {
+        otl_state_unlock();
+        return ESP_OK;
+    }
+    runtime_led_thermal_limit_c = normalized_limit;
+    otl_runtime_settings_snapshot_locked(&settings);
+    otl_state_unlock();
+
+    otl_runtime_settings_notify_listeners(&settings, source);
+    thermal_update(telemetry_ntc_temp_c, telemetry_chip_temp_c);
+    otl_telemetry_notify_current();
+
+    snprintf(event_message,
+             sizeof(event_message),
+             "Updated LED thermal limit to %.0fC",
+             normalized_limit);
+    otl_event_emit(OTL_EVENT_LEVEL_INFO, "thermal", event_message);
+    return ESP_OK;
+}
+
+const char *otl_event_level_to_string(otl_event_level_t level)
+{
+    switch (level) {
+        case OTL_EVENT_LEVEL_WARNING:
+            return "warning";
+        case OTL_EVENT_LEVEL_ERROR:
+            return "error";
+        case OTL_EVENT_LEVEL_INFO:
+        default:
+            return "info";
+    }
+}
+
+void otl_event_emit(otl_event_level_t level, const char *category, const char *message)
+{
+    otl_runtime_event_t event = {0};
+
+    if (category == NULL || message == NULL) {
+        return;
+    }
+
+    otl_state_lock();
+    snprintf(s_last_event.timestamp,
+             sizeof(s_last_event.timestamp),
+             "%s",
+             otl_log_localtime((char[OTL_RUNTIME_EVENT_TIMESTAMP_LEN]){0},
+                               OTL_RUNTIME_EVENT_TIMESTAMP_LEN));
+    s_last_event.level = level;
+    snprintf(s_last_event.category, sizeof(s_last_event.category), "%s", category);
+    snprintf(s_last_event.message, sizeof(s_last_event.message), "%s", message);
+    otl_event_snapshot_locked(&event);
+    otl_state_unlock();
+
+    otl_event_notify_listeners(&event);
+}
+
+static bool otl_telemetry_update(float lux,
+                                 float ntc_temp_c,
+                                 float chip_temp_c,
+                                 bool wifi_connected,
+                                 int wifi_rssi_dbm)
+{
+    bool changed = false;
+    bool wifi_changed = false;
+    otl_telemetry_t telemetry = {0};
+
+    otl_state_lock();
+    wifi_changed = (telemetry_wifi_connected != wifi_connected);
+
+    if (otl_runtime_float_changed(telemetry_ambient_lux, lux, 0.5f)) {
+        telemetry_ambient_lux = lux;
+        changed = true;
+    }
+    if (otl_runtime_float_changed(telemetry_ntc_temp_c, ntc_temp_c, 0.1f)) {
+        telemetry_ntc_temp_c = ntc_temp_c;
+        changed = true;
+    }
+    if (otl_runtime_float_changed(telemetry_chip_temp_c, chip_temp_c, 0.1f)) {
+        telemetry_chip_temp_c = chip_temp_c;
+        changed = true;
+    }
+    if (telemetry_wifi_connected != wifi_connected) {
+        telemetry_wifi_connected = wifi_connected;
+        changed = true;
+    }
+    if (telemetry_wifi_rssi_dbm != wifi_rssi_dbm) {
+        telemetry_wifi_rssi_dbm = wifi_rssi_dbm;
+        changed = true;
+    }
+    if (changed) {
+        otl_telemetry_snapshot_locked(&telemetry);
+    }
+    otl_state_unlock();
+
+    if (changed) {
+        otl_telemetry_notify_listeners(&telemetry);
+    }
+    if (wifi_changed) {
+        otl_event_emit(OTL_EVENT_LEVEL_INFO,
+                       "wifi",
+                       wifi_connected ? "WiFi connected" : "WiFi disconnected");
+    }
+
+    return changed;
+}
+
 static void thermal_update(float ntc_c, float chip_c)
 {
-    bool prev_ntc_hot = thermal_ntc_hot;
-    bool prev_chip_hot = thermal_chip_hot;
+    bool prev_ntc_hot = false;
+    bool prev_chip_hot = false;
+    bool curr_ntc_hot = false;
+    bool curr_chip_hot = false;
+    bool throttled = false;
+    float new_cap = (float)MAX_BRIGHTNESS_PERCENT;
+    float ntc_hot_limit_c = OTL_THERMAL_NTC_HOT_C;
+
+    otl_state_lock();
+    prev_ntc_hot = thermal_ntc_hot;
+    prev_chip_hot = thermal_chip_hot;
+    ntc_hot_limit_c = runtime_led_thermal_limit_c;
 
     if (!isnan(ntc_c)) {
         if (!thermal_ntc_hot) {
-            if (ntc_c >= OTL_THERMAL_NTC_HOT_C) {
+            if (ntc_c >= ntc_hot_limit_c) {
                 if (thermal_ntc_hot_confirm_polls < 255) {
                     thermal_ntc_hot_confirm_polls++;
                 }
@@ -1224,7 +2163,7 @@ static void thermal_update(float ntc_c, float chip_c)
             }
         } else {
             thermal_ntc_hot_confirm_polls = 0;
-            if (ntc_c <= (OTL_THERMAL_NTC_HOT_C - OTL_THERMAL_NTC_HYST_C)) {
+            if (ntc_c <= (ntc_hot_limit_c - OTL_THERMAL_NTC_HYST_C)) {
                 thermal_ntc_hot = false;
             }
         }
@@ -1244,8 +2183,8 @@ static void thermal_update(float ntc_c, float chip_c)
         }
     }
 
-    bool throttled = thermal_ntc_hot || thermal_chip_hot;
-    float new_cap = throttled ? OTL_THERMAL_DIM_MAX_BRIGHTNESS_PERCENT : (float)MAX_BRIGHTNESS_PERCENT;
+    throttled = thermal_ntc_hot || thermal_chip_hot;
+    new_cap = throttled ? OTL_THERMAL_DIM_MAX_BRIGHTNESS_PERCENT : (float)MAX_BRIGHTNESS_PERCENT;
 
     if (fabsf(new_cap - (float)thermal_brightness_cap_percent) > 0.01f) {
         thermal_brightness_cap_percent = new_cap;
@@ -1253,27 +2192,58 @@ static void thermal_update(float ntc_c, float chip_c)
             update_outputs();
         }
     }
+    curr_ntc_hot = thermal_ntc_hot;
+    curr_chip_hot = thermal_chip_hot;
+    otl_state_unlock();
 
-    if ((prev_ntc_hot != thermal_ntc_hot) || (prev_chip_hot != thermal_chip_hot)) {
+    if ((prev_ntc_hot != curr_ntc_hot) || (prev_chip_hot != curr_chip_hot)) {
         OTL_LOGW("thermal",
                  "Thermal %s (NTC=%s%.1fC, Chip=%s%.1fC) -> max=%.0f%%",
                  throttled ? "LIMIT" : "OK",
-                 thermal_ntc_hot ? "HOT " : "",
+                 curr_ntc_hot ? "HOT " : "",
                  ntc_c,
-                 thermal_chip_hot ? "HOT " : "",
+                 curr_chip_hot ? "HOT " : "",
                  chip_c,
                  new_cap);
+        otl_event_emit(OTL_EVENT_LEVEL_WARNING,
+                       "thermal",
+                       throttled ? "Thermal limit active" : "Thermal limit cleared");
     }
 }
 
 #if CONFIG_OTL_CIRCADIAN_ENABLE
-static void otl_circadian_apply_cb(float base_ratio, void *ctx)
+static bool otl_circadian_schedule_getter(otl_circadian_schedule_t *schedule, void *ctx)
 {
     (void)ctx;
+
+    if (schedule == NULL) {
+        return false;
+    }
+
+    return otl_runtime_get_circadian_schedule(&schedule->coolest_seconds,
+                                              &schedule->warmest_seconds);
+}
+
+static void otl_circadian_apply_cb(float base_ratio, void *ctx)
+{
+    bool changed = false;
+    otl_public_state_t state = {0};
+
+    (void)ctx;
+    otl_state_lock();
+    float prev_temp_ratio = temp_ratio;
     circadian_base_ratio = base_ratio;
     circadian_apply_current_ratio();
-    if (led_state) {
+    changed = runtime_circadian_enabled && otl_state_float_changed(prev_temp_ratio, temp_ratio);
+    if (led_state && changed) {
         update_outputs();
+    }
+    if (changed) {
+        otl_state_snapshot_locked(&state);
+    }
+    otl_state_unlock();
+    if (changed) {
+        otl_state_notify_listeners(&state, OTL_CHANGE_SOURCE_CIRCADIAN);
     }
 }
 #endif
@@ -1289,14 +2259,20 @@ static void fade_brightness(int start, int end, int step, int delay_ms)
 
     if (start < end) {
         for (int b = start; b <= end; b += step) {
-            brightness_percent = b;
-            update_outputs();
+            otl_state_apply_light_update(&(otl_light_update_t) {
+                .set_brightness = true,
+                .force_on_with_brightness = true,
+                .brightness_percent = (float)b,
+            }, OTL_CHANGE_SOURCE_OCCUPANCY);
             vTaskDelay(pdMS_TO_TICKS(delay_ms));
         }
     } else {
         for (int b = start; b >= end; b -= step) {
-            brightness_percent = b;
-            update_outputs();
+            otl_state_apply_light_update(&(otl_light_update_t) {
+                .set_brightness = true,
+                .force_on_with_brightness = true,
+                .brightness_percent = (float)b,
+            }, OTL_CHANGE_SOURCE_OCCUPANCY);
             vTaskDelay(pdMS_TO_TICKS(delay_ms));
         }
     }
@@ -1304,54 +2280,70 @@ static void fade_brightness(int start, int end, int step, int delay_ms)
 
 static void handle_occupancy_lost(void)
 {
+    int fade_start = 0;
+
+    otl_state_lock();
     radar_occupied = false;
 
     // Only fade out if the light is currently on and
     // we haven't already faded it out.
     if (!led_state || occupancy_faded_out) {
+        otl_state_unlock();
         return;
     }
 
     saved_led_state  = led_state;
     saved_brightness = (int)lroundf(fminf(brightness_percent, (float)MAX_BRIGHTNESS_PERCENT));
-#if CONFIG_OTL_CIRCADIAN_ENABLE
+    fade_start = (int)lroundf(brightness_percent);
     saved_temp_ratio_offset = temp_ratio_user_offset;
-#else
     saved_temp_ratio = temp_ratio;
-#endif
+    otl_state_unlock();
 
     // Fade down to 0% brightness, then turn off.
-    fade_brightness((int)lroundf(brightness_percent), 0, BRIGHT_STEP, 15);
-    led_state = false;
-    update_outputs();
-
+    fade_brightness(fade_start, 0, BRIGHT_STEP, 15);
     occupancy_faded_out = true;
+    otl_state_apply_light_update(&(otl_light_update_t) {
+        .set_power = true,
+        .power_on = false,
+    }, OTL_CHANGE_SOURCE_OCCUPANCY);
 }
 
 static void handle_occupancy_gained(void)
 {
+    int fade_end = 0;
+
+    otl_state_lock();
     radar_occupied = true;
 
     // Only fade back in if we previously faded out the light
     // and the saved state indicates it should be on.
     if (!occupancy_faded_out || !saved_led_state) {
+        otl_state_unlock();
         return;
     }
 
-    led_state  = true;
+    fade_end = saved_brightness;
 #if CONFIG_OTL_CIRCADIAN_ENABLE
-    temp_ratio_user_offset = saved_temp_ratio_offset;
-    circadian_apply_current_ratio();
+    if (runtime_circadian_enabled) {
+        temp_ratio_user_offset = saved_temp_ratio_offset;
+        circadian_apply_current_ratio();
+    } else {
+        temp_ratio = saved_temp_ratio;
+    }
 #else
     temp_ratio = saved_temp_ratio;
 #endif
 
     // Fade from 0 up to the saved brightness.
     brightness_percent = 0;
+    led_state = true;
+    otl_public_state_t state = {0};
     update_outputs();
-    fade_brightness(0, saved_brightness, BRIGHT_STEP, 15);
-
     occupancy_faded_out = false;
+    otl_state_snapshot_locked(&state);
+    otl_state_unlock();
+    otl_state_notify_listeners(&state, OTL_CHANGE_SOURCE_OCCUPANCY);
+    fade_brightness(0, fade_end, BRIGHT_STEP, 15);
 }
 #endif
 
@@ -1409,20 +2401,23 @@ static temperature_sensor_handle_t chip_temp_handle = NULL;
 
 static void chip_temp_init(void)
 {
-    // Pick a range that covers typical ESP32-S3 junction temperatures while
-    // still allowing the driver to select a valid internal calibration range.
-    temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(20, 100);
+    // Espressif recommends configuring the expected operating range up front so
+    // the driver can choose the lowest-error internal calibration band. This
+    // light uses the reading as an internal ESP32-S3 junction thermal guard, not as an
+    // ambient sensor, so target the expected junction range with headroom above
+    // the 75 C chip hot threshold.
+    temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(20, 80);
 
     esp_err_t err = temperature_sensor_install(&cfg, &chip_temp_handle);
     if (err != ESP_OK) {
-        OTL_LOGW("sensor", "Chip temp sensor install failed: %s", esp_err_to_name(err));
+        OTL_LOGW("sensor", "ESP32-S3 internal temp sensor install failed: %s", esp_err_to_name(err));
         chip_temp_handle = NULL;
         return;
     }
 
     err = temperature_sensor_enable(chip_temp_handle);
     if (err != ESP_OK) {
-        OTL_LOGW("sensor", "Chip temp sensor enable failed: %s", esp_err_to_name(err));
+        OTL_LOGW("sensor", "ESP32-S3 internal temp sensor enable failed: %s", esp_err_to_name(err));
         (void)temperature_sensor_uninstall(chip_temp_handle);
         chip_temp_handle = NULL;
     }
@@ -1444,6 +2439,22 @@ static float read_chip_temperature(void)
 static void chip_temp_init(void) {}
 static float read_chip_temperature(void) { return NAN; }
 #endif
+
+static bool read_wifi_rssi(int *rssi_out)
+{
+    wifi_ap_record_t ap_info = {0};
+
+    if (rssi_out == NULL || !otl_net_wifi_is_connected()) {
+        return false;
+    }
+
+    if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
+        return false;
+    }
+
+    *rssi_out = ap_info.rssi;
+    return true;
+}
 
 static void adc_init(void)
 {
@@ -1674,6 +2685,16 @@ static inline float brightness_deep_dim_min_repeat_ms(float b_percent)
     return 0.0f;
 }
 
+static inline bool brightness_is_above_normal_min(float brightness_percent)
+{
+    return brightness_percent > (MIN_BRIGHTNESS_PERCENT + MIN_BRIGHTNESS_HOLD_EPSILON_PERCENT);
+}
+
+static inline bool brightness_is_at_or_near_normal_min(float brightness_percent)
+{
+    return !brightness_is_above_normal_min(brightness_percent);
+}
+
 // --- Tap/double-tap tracking ---
 static uint32_t tap_last_ms[PAD_COUNT] = {0};
 
@@ -1681,6 +2702,7 @@ static uint32_t button_press_time[PAD_COUNT] = {0};
 static uint32_t last_repeat_time[PAD_COUNT] = {0};
 static bool button_being_held[PAD_COUNT] = {0};
 static bool dim_down_hold_clamp_at_min = false;
+static bool dim_down_release_allows_deep_dim = false;
 
 
 // --- Touch event processing task ---
@@ -1728,19 +2750,25 @@ static void touch_task(void *arg)
         bool power_pressed_edge = power_pressed && !prev_pressed[0];
 
         if (power_pressed_edge) {
+            otl_public_state_t state = {0};
             power_press_ms = now;
+            otl_state_get_public(&state);
 
-            if (!led_state) {
-                led_state = true;
+            if (!state.is_on) {
                 neopixel_enabled = false;
                 power_arm_neopixel = true;
-                update_outputs();
+                otl_state_apply_light_update(&(otl_light_update_t) {
+                    .set_power = true,
+                    .power_on = true,
+                }, OTL_CHANGE_SOURCE_TOUCH);
                 OTL_LOG_TOUCHI("LED turned: ON");
             } else {
-                led_state = false;
                 neopixel_enabled = false;
                 power_arm_neopixel = false;
-                update_outputs();
+                otl_state_apply_light_update(&(otl_light_update_t) {
+                    .set_power = true,
+                    .power_on = false,
+                }, OTL_CHANGE_SOURCE_TOUCH);
                 OTL_LOG_TOUCHI("LED turned: OFF");
             }
         }
@@ -1748,7 +2776,9 @@ static void touch_task(void *arg)
         if (power_pressed && power_arm_neopixel && !neopixel_enabled &&
             (now - power_press_ms) >= POWER_HOLD_NEOPIXEL_MS) {
             neopixel_enabled = true;
+            otl_state_lock();
             update_outputs();
+            otl_state_unlock();
             OTL_LOG_TOUCHI("NeoPixel enabled");
         }
 
@@ -1758,8 +2788,9 @@ static void touch_task(void *arg)
 
         // --- Brightness UP ---
         if (pad_intr & (1UL << touch_pads[1])) {
-            led_state = true; // Ensure LED is ON when changing brightness
-            
+            otl_public_state_t state = {0};
+            otl_state_get_public(&state);
+
             // First press or double-tap
             if (!button_being_held[1]) {
                 button_being_held[1] = true;
@@ -1767,36 +2798,45 @@ static void touch_task(void *arg)
                 last_repeat_time[1] = now;
 
                 if (now - tap_last_ms[1] < DOUBLE_TAP_MS) {
-                    brightness_percent = MAX_BRIGHTNESS_PERCENT;
-                    update_outputs();
+                    otl_state_apply_light_update(&(otl_light_update_t) {
+                        .set_power = true,
+                        .power_on = true,
+                        .set_brightness = true,
+                        .force_on_with_brightness = true,
+                        .brightness_percent = (float)MAX_BRIGHTNESS_PERCENT,
+                    }, OTL_CHANGE_SOURCE_TOUCH);
                     OTL_LOG_TOUCHI("Brightness set to MAX (%d%%)", MAX_BRIGHTNESS_PERCENT);
                     tap_last_ms[1] = now;
                 } else {
-                    float prev_brightness = brightness_percent;
-                    brightness_percent = fminf(brightness_percent + (float)BRIGHT_STEP, (float)MAX_BRIGHTNESS_PERCENT);
-                    if (brightness_percent != prev_brightness) {
-                        update_outputs();
-                        OTL_LOG_TOUCHI("Brightness increased to: %d%%", (int)lroundf(brightness_percent));
+                    float new_brightness = fminf(state.brightness_percent + (float)BRIGHT_STEP,
+                                                 (float)MAX_BRIGHTNESS_PERCENT);
+                    if (new_brightness != state.brightness_percent) {
+                        otl_state_apply_light_update(&(otl_light_update_t) {
+                            .set_power = true,
+                            .power_on = true,
+                            .set_brightness = true,
+                            .force_on_with_brightness = true,
+                            .brightness_percent = new_brightness,
+                        }, OTL_CHANGE_SOURCE_TOUCH);
+                        OTL_LOG_TOUCHI("Brightness increased to: %d%%", (int)lroundf(new_brightness));
                     }
                     tap_last_ms[1] = now;
                 }
-                  
             }
         }
 
         // --- Brightness DOWN ---
         if (pad_intr & (1UL << touch_pads[2])) {
+            otl_public_state_t state = {0};
             // If the light is currently OFF, start from the normal minimum so a
             // dim-down press never "flashes" on at a previously-saved high
             // brightness.
-            bool was_off = !led_state;
-            if (was_off) {
-                brightness_percent = MIN_BRIGHTNESS_PERCENT;
-            }
-            led_state = true;
-            if (was_off) {
-                update_outputs();
-            }
+            otl_state_get_public(&state);
+            bool was_off = !state.is_on;
+            float current_brightness = was_off ? MIN_BRIGHTNESS_PERCENT : state.brightness_percent;
+            bool at_or_near_normal_min = brightness_is_at_or_near_normal_min(current_brightness);
+            bool allow_deep_dim_on_this_hold =
+                dim_down_release_allows_deep_dim && at_or_near_normal_min && !was_off;
              
             if (!button_being_held[2]) {
                 button_being_held[2] = true;
@@ -1806,45 +2846,63 @@ static void touch_task(void *arg)
                 // double-tap minimum) on the same press-and-hold. If we started
                 // above MIN, or we just turned on from OFF, clamp this hold at
                 // MIN until the user releases and holds again.
-                dim_down_hold_clamp_at_min = was_off || (brightness_percent > MIN_BRIGHTNESS_PERCENT);
+                dim_down_hold_clamp_at_min = !(allow_deep_dim_on_this_hold || at_or_near_normal_min) || was_off;
+                dim_down_release_allows_deep_dim = false;
 
-                if ((brightness_percent >= MIN_BRIGHTNESS_PERCENT) && (now - tap_last_ms[2] < DOUBLE_TAP_MS)) {
-                    brightness_percent = MIN_BRIGHTNESS_PERCENT;
-                    update_outputs();
+                if ((current_brightness >= MIN_BRIGHTNESS_PERCENT) && (now - tap_last_ms[2] < DOUBLE_TAP_MS)) {
+                    otl_state_apply_light_update(&(otl_light_update_t) {
+                        .set_power = true,
+                        .power_on = true,
+                        .set_brightness = true,
+                        .force_on_with_brightness = true,
+                        .brightness_percent = MIN_BRIGHTNESS_PERCENT,
+                    }, OTL_CHANGE_SOURCE_TOUCH);
                     OTL_LOG_TOUCHI("Brightness set to MIN (%d%%)", (int)lroundf(MIN_BRIGHTNESS_PERCENT));
                     tap_last_ms[2] = now;
                 } else {
-                    float prev_brightness = brightness_percent;
-                    float min_limit = (brightness_percent > MIN_BRIGHTNESS_PERCENT) ? MIN_BRIGHTNESS_PERCENT : HOLD_MIN_BRIGHTNESS_PERCENT;
-                    brightness_percent = fmaxf(brightness_percent - (float)BRIGHT_STEP, min_limit);
-                    if (brightness_percent != prev_brightness) {
-                        update_outputs();
-                        OTL_LOG_TOUCHI("Brightness decreased to: %d%%", (int)lroundf(brightness_percent));
+                    float min_limit = brightness_is_above_normal_min(current_brightness)
+                                          ? MIN_BRIGHTNESS_PERCENT
+                                          : HOLD_MIN_BRIGHTNESS_PERCENT;
+                    float new_brightness = fmaxf(current_brightness - (float)BRIGHT_STEP, min_limit);
+                    if (new_brightness != current_brightness) {
+                        otl_state_apply_light_update(&(otl_light_update_t) {
+                            .set_power = true,
+                            .power_on = true,
+                            .set_brightness = true,
+                            .force_on_with_brightness = true,
+                            .brightness_percent = new_brightness,
+                        }, OTL_CHANGE_SOURCE_TOUCH);
+                        OTL_LOG_TOUCHI("Brightness decreased to: %d%%", (int)lroundf(new_brightness));
                     }
                     tap_last_ms[2] = now;
                 }
-                  
             }
         }
 
         // --- Temp UP (cooler) ---
-        if ((pad_intr & (1UL << touch_pads[3])) && led_state) {
-            if (!button_being_held[3]) {
+        if (pad_intr & (1UL << touch_pads[3])) {
+            otl_public_state_t state = {0};
+            otl_state_get_public(&state);
+            if (state.is_on && !button_being_held[3]) {
                 button_being_held[3] = true;
                 button_press_time[3] = now;
                 last_repeat_time[3] = now;
                  
                 if (now - tap_last_ms[3] < DOUBLE_TAP_MS) {
-                    otl_set_temp_ratio(1.0f);
-                    update_outputs();
+                    otl_state_apply_light_update(&(otl_light_update_t) {
+                        .set_temp_ratio = true,
+                        .temp_ratio = 1.0f,
+                    }, OTL_CHANGE_SOURCE_TOUCH);
                     OTL_LOG_TOUCHI("Temperature set to MAX COOL (1.0)");
                 } else {
-                    float prev_temp = temp_ratio;
-                    otl_adjust_temp_ratio(TEMP_STEP);
-                    if (temp_ratio != prev_temp) {
-                        update_outputs();
+                    float new_temp = clampf(state.temp_ratio + TEMP_STEP, 0.0f, 1.0f);
+                    if (new_temp != state.temp_ratio) {
+                        otl_state_apply_light_update(&(otl_light_update_t) {
+                            .set_temp_ratio = true,
+                            .temp_ratio = new_temp,
+                        }, OTL_CHANGE_SOURCE_TOUCH);
                         OTL_LOG_TOUCHI("White temp increase: %.2f | Warm temp decrease: %.2f", 
-                                temp_ratio, 1.0f - temp_ratio);
+                                new_temp, 1.0f - new_temp);
                     }
                 }
                 tap_last_ms[3] = now;
@@ -1852,29 +2910,34 @@ static void touch_task(void *arg)
         }
 
         // --- Temp DOWN (warmer) ---
-        if ((pad_intr & (1UL << touch_pads[4])) && led_state) {
-            if (!button_being_held[4]) {
+        if (pad_intr & (1UL << touch_pads[4])) {
+            otl_public_state_t state = {0};
+            otl_state_get_public(&state);
+            if (state.is_on && !button_being_held[4]) {
                 button_being_held[4] = true;
                 button_press_time[4] = now;
                 last_repeat_time[4] = now;
                  
                 if (now - tap_last_ms[4] < DOUBLE_TAP_MS) {
-                    otl_set_temp_ratio(0.0f);
-                    update_outputs();
+                    otl_state_apply_light_update(&(otl_light_update_t) {
+                        .set_temp_ratio = true,
+                        .temp_ratio = 0.0f,
+                    }, OTL_CHANGE_SOURCE_TOUCH);
                     OTL_LOG_TOUCHI("Temperature set to MAX WARM (0.0)");
                 } else {
-                    float prev_temp = temp_ratio;
-                    otl_adjust_temp_ratio(-TEMP_STEP);
-                    if (temp_ratio != prev_temp) {
-                        update_outputs();
+                    float new_temp = clampf(state.temp_ratio - TEMP_STEP, 0.0f, 1.0f);
+                    if (new_temp != state.temp_ratio) {
+                        otl_state_apply_light_update(&(otl_light_update_t) {
+                            .set_temp_ratio = true,
+                            .temp_ratio = new_temp,
+                        }, OTL_CHANGE_SOURCE_TOUCH);
                         OTL_LOG_TOUCHI("Cool temp decrease: %.2f | Warm temp increase: %.2f", 
-                                temp_ratio, 1.0f - temp_ratio);
+                                new_temp, 1.0f - new_temp);
                     }
                 }
                 tap_last_ms[4] = now;
             }
         }
-        
         // Handle button hold and repeat - this is independent of queue events
         // to ensure consistent timing
         now = esp_timer_get_time() / 1000; // Update current time
@@ -1890,6 +2953,11 @@ static void touch_task(void *arg)
                 if (!pressed_now[i]) {
                     button_being_held[i] = false;
                     if (i == 2) {
+                        otl_public_state_t released_state = {0};
+                        otl_state_get_public(&released_state);
+                        dim_down_release_allows_deep_dim =
+                            dim_down_hold_clamp_at_min &&
+                            brightness_is_at_or_near_normal_min(released_state.brightness_percent);
                         dim_down_hold_clamp_at_min = false;
                     }
                     continue;
@@ -1910,6 +2978,8 @@ static void touch_task(void *arg)
                         want_hold_stepper = true;
                         uint32_t dt_ms = now - last_repeat_time[i];
                         last_repeat_time[i] = now;
+                        otl_public_state_t state = {0};
+                        otl_state_get_public(&state);
 
                         float effective_repeat_ms = base_repeat_ms;
                         float dist_to_limit = 0.0f;
@@ -1918,9 +2988,9 @@ static void touch_task(void *arg)
                             min_brightness_limit = dim_down_hold_clamp_at_min ? MIN_BRIGHTNESS_PERCENT : HOLD_MIN_BRIGHTNESS_PERCENT;
                         }
                         if (i == 1) {
-                            dist_to_limit = (float)MAX_BRIGHTNESS_PERCENT - brightness_percent;
+                            dist_to_limit = (float)MAX_BRIGHTNESS_PERCENT - state.brightness_percent;
                         } else {
-                            dist_to_limit = brightness_percent - min_brightness_limit;
+                            dist_to_limit = state.brightness_percent - min_brightness_limit;
                             if (dist_to_limit < 0.0f) {
                                 dist_to_limit = 0.0f;
                             }
@@ -1930,7 +3000,7 @@ static void touch_task(void *arg)
                             effective_repeat_ms = end_min_ms;
                         }
 
-                        float deep_min_ms = brightness_deep_dim_min_repeat_ms(brightness_percent);
+                        float deep_min_ms = brightness_deep_dim_min_repeat_ms(state.brightness_percent);
                         if (deep_min_ms > effective_repeat_ms) {
                             effective_repeat_ms = deep_min_ms;
                         }
@@ -1941,16 +3011,21 @@ static void touch_task(void *arg)
                             break;
                         }
 
-                        float prev_brightness = brightness_percent;
+                        float new_brightness = state.brightness_percent;
                         if (i == 1) {
-                            brightness_percent = fminf(brightness_percent + delta_percent, (float)MAX_BRIGHTNESS_PERCENT);
+                            new_brightness = fminf(state.brightness_percent + delta_percent, (float)MAX_BRIGHTNESS_PERCENT);
                         } else {
-                            brightness_percent = fmaxf(brightness_percent - delta_percent, min_brightness_limit);
+                            new_brightness = fmaxf(state.brightness_percent - delta_percent, min_brightness_limit);
                         }
 
-                        if (brightness_percent != prev_brightness) {
-                            led_state = true;
-                            update_outputs();
+                        if (new_brightness != state.brightness_percent) {
+                            otl_state_apply_light_update(&(otl_light_update_t) {
+                                .set_power = true,
+                                .power_on = true,
+                                .set_brightness = true,
+                                .force_on_with_brightness = true,
+                                .brightness_percent = new_brightness,
+                            }, OTL_CHANGE_SOURCE_TOUCH);
                         }
                         break;
                     }
@@ -1958,7 +3033,9 @@ static void touch_task(void *arg)
                     case 3: // Temp UP
                     case 4: // Temp DOWN
                     {
-                        if (!led_state) {
+                        otl_public_state_t state = {0};
+                        otl_state_get_public(&state);
+                        if (!state.is_on) {
                             break;
                         }
 
@@ -1971,7 +3048,7 @@ static void touch_task(void *arg)
                             effective_repeat_ms = (float)dt_ms;
                         }
 
-                        float dist_to_limit = (i == 3) ? (1.0f - temp_ratio) : temp_ratio;
+                        float dist_to_limit = (i == 3) ? (1.0f - state.temp_ratio) : state.temp_ratio;
                         if (dist_to_limit < TEMP_HOLD_VERY_SLOW_ZONE_RATIO) {
                             if (effective_repeat_ms < TEMP_HOLD_MIN_REPEAT_MS_VERY_SLOW) {
                                 effective_repeat_ms = (float)TEMP_HOLD_MIN_REPEAT_MS_VERY_SLOW;
@@ -1988,11 +3065,12 @@ static void touch_task(void *arg)
                             break;
                         }
 
-                        float prev_temp = temp_ratio;
-                        otl_adjust_temp_ratio((i == 3) ? delta_ratio : -delta_ratio);
-
-                        if (temp_ratio != prev_temp) {
-                            update_outputs();
+                        float new_temp = clampf(state.temp_ratio + ((i == 3) ? delta_ratio : -delta_ratio), 0.0f, 1.0f);
+                        if (new_temp != state.temp_ratio) {
+                            otl_state_apply_light_update(&(otl_light_update_t) {
+                                .set_temp_ratio = true,
+                                .temp_ratio = new_temp,
+                            }, OTL_CHANGE_SOURCE_TOUCH);
                         }
                         break;
                     }
@@ -2022,14 +3100,18 @@ static void touch_task(void *arg)
 #if CONFIG_OTL_PRESENCE_SENSOR
 static void radar_task(void *arg)
 {
+    otl_public_state_t state = {0};
     // Configure initial state from pin level + last_sample on both candidate OUT pins
     int level15 = gpio_get_level(RADAR_OUT_GPIO);
     int level14 = gpio_get_level(RADAR_OUT_GPIO_ALT);
     bool out_state = (level14 == 1) || (level15 == 1);
     bool moving = radar_last_sample.valid && (radar_last_sample.targetType & 0x01);
     bool stationary = radar_last_sample.valid && (radar_last_sample.targetType & 0x02);
-    radar_presence = out_state || moving || stationary;
-    radar_occupied = radar_presence;
+    bool initial_presence = out_state || moving || stationary;
+    otl_state_lock();
+    radar_occupied = initial_presence;
+    otl_state_unlock();
+    otl_state_set_presence(initial_presence, OTL_CHANGE_SOURCE_OCCUPANCY);
 
     uint32_t last_log_ms      = 0;
     uint32_t last_presence_ms = esp_timer_get_time() / 1000;
@@ -2037,6 +3119,7 @@ static void radar_task(void *arg)
     bool     presence_candidate_active   = false;
 
     while (1) {
+        bool currently_occupied = false;
         // 1) Read any pending UART data and update radar_last_sample
         uint8_t buf[64];
         int len = uart_read_bytes(RADAR_UART_NUM, buf, sizeof(buf), 0);
@@ -2090,8 +3173,9 @@ static void radar_task(void *arg)
         // Log periodically so we can see what the radar is doing,
         // even if presence does not change.
         if (now_ms - last_log_ms > 2000) {
+            otl_state_get_public(&state);
             OTL_LOG_RADARI("presence=%s OUT14=%d OUT15=%d moving=%d stationary=%d movDist=%ucm statDist=%ucm",
-                           (radar_presence ? "ON" : "OFF"),
+                           (state.presence ? "ON" : "OFF"),
                            out14_level, out15_level,
                            moving ? 1 : 0, stationary ? 1 : 0,
                            (unsigned)radar_last_sample.movingDist,
@@ -2104,17 +3188,20 @@ static void radar_task(void *arg)
         //    RADAR_PRESENCE_ON_DELAY_MS
         //  - turn OFF only after absence has been continuous for
         //    RADAR_ABSENCE_TIMEOUT_MS
-        if (new_presence && !radar_occupied &&
+        otl_state_get_public(&state);
+        otl_state_lock();
+        currently_occupied = radar_occupied;
+        otl_state_unlock();
+
+        if (new_presence && !currently_occupied &&
             presence_candidate_active &&
             (now_ms - presence_candidate_since_ms) > RADAR_PRESENCE_ON_DELAY_MS) {
-            radar_presence = true;
+            otl_state_set_presence(true, OTL_CHANGE_SOURCE_OCCUPANCY);
             handle_occupancy_gained();
-            radar_occupied = true;
-        } else if (!new_presence && radar_occupied &&
+        } else if (!new_presence && currently_occupied &&
                    (now_ms - last_presence_ms) > RADAR_ABSENCE_TIMEOUT_MS) {
-            radar_presence = false;
+            otl_state_set_presence(false, OTL_CHANGE_SOURCE_OCCUPANCY);
             handle_occupancy_lost();
-            radar_occupied = false;
         }
 
         TickType_t delay_ticks = pdMS_TO_TICKS(RADAR_TASK_LOOP_INTERVAL_MS);
@@ -2131,29 +3218,58 @@ static void sensor_task(void *arg)
 {
     (void)arg;
     TickType_t last_wake = xTaskGetTickCount();
+    uint32_t verbose_diag_elapsed_ms = SENSOR_READ_INTERVAL_MS;
 #if CONFIG_OTL_SERIAL_OUTPUT && (CONFIG_OTL_LOG_STATUS || CONFIG_OTL_SENSOR_DEBUG)
     uint32_t log_elapsed_ms = SENSOR_READ_INTERVAL_MS;
 #endif
 
     while (1) {
+        float lux = read_als_lux();
         float ntc_temp  = read_ntc_temperature();
         float chip_temp = read_chip_temperature();
+        bool wifi_connected = otl_net_wifi_is_connected();
+        int wifi_rssi_dbm = telemetry_wifi_rssi_dbm;
 
         thermal_update(ntc_temp, chip_temp);
+        if (wifi_connected) {
+            (void)read_wifi_rssi(&wifi_rssi_dbm);
+        } else {
+            wifi_rssi_dbm = 0;
+        }
+
+        (void)otl_telemetry_update(lux, ntc_temp, chip_temp, wifi_connected, wifi_rssi_dbm);
+
+        verbose_diag_elapsed_ms += THERMAL_POLL_INTERVAL_MS;
+        if (verbose_diag_elapsed_ms >= SENSOR_READ_INTERVAL_MS &&
+            otl_runtime_verbose_diagnostics_enabled()) {
+            char event_message[OTL_RUNTIME_EVENT_MESSAGE_LEN] = {0};
+
+            verbose_diag_elapsed_ms = 0;
+            snprintf(event_message,
+                     sizeof(event_message),
+                     "Sensors lux=%.0f ntc=%.1fC chip=%.1fC cap=%.0f%% rssi=%ddBm",
+                     lux,
+                     ntc_temp,
+                     chip_temp,
+                     thermal_brightness_cap_percent,
+                     wifi_rssi_dbm);
+            otl_event_emit(OTL_EVENT_LEVEL_INFO, "diagnostics", event_message);
+        }
 
 #if CONFIG_OTL_SERIAL_OUTPUT && (CONFIG_OTL_LOG_STATUS || CONFIG_OTL_SENSOR_DEBUG)
         log_elapsed_ms += THERMAL_POLL_INTERVAL_MS;
         if (log_elapsed_ms >= SENSOR_READ_INTERVAL_MS) {
+            otl_public_state_t state = {0};
             log_elapsed_ms = 0;
-            float lux = read_als_lux();
+            otl_state_get_public(&state);
 #if CONFIG_OTL_LOG_STATUS
-            const char *light_state = led_state ? "ON" : "OFF";
-            float temp_cool_ratio = temp_ratio;
-            float temp_warm_ratio = 1.0f - temp_ratio;
+            const char *light_state = state.is_on ? "ON" : "OFF";
+            float temp_cool_ratio = state.temp_ratio;
+            float temp_warm_ratio = 1.0f - state.temp_ratio;
             if (!isnan(chip_temp)) {
                 OTL_LOG_STATUSI("Light %s | B %.0f%% | Temp %.2f (cool %.0f%%/warm %.0f%%) | Ambient %.0f lux | NTC %.1f °C | Chip %.1f °C",
                                 light_state,
-                                brightness_percent,
+                                state.brightness_percent,
                                 temp_cool_ratio,
                                 temp_cool_ratio * 100.0f,
                                 temp_warm_ratio * 100.0f,
@@ -2163,7 +3279,7 @@ static void sensor_task(void *arg)
             } else {
                 OTL_LOG_STATUSI("Light %s | B %.0f%% | Temp %.2f (cool %.0f%%/warm %.0f%%) | Ambient %.0f lux | NTC %.1f °C",
                                 light_state,
-                                brightness_percent,
+                                state.brightness_percent,
                                 temp_cool_ratio,
                                 temp_cool_ratio * 100.0f,
                                 temp_warm_ratio * 100.0f,
@@ -2248,6 +3364,16 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_timer_create(&pwm_log_timer_args, &pwm_log_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(pwm_log_timer, (uint64_t)CONFIG_OTL_PWM_LOG_INTERVAL_MS * 1000ULL));
 #endif
+
+    otl_state_mutex = xSemaphoreCreateMutex();
+    if (otl_state_mutex == NULL) {
+        abort();
+    }
+
+    esp_err_t runtime_settings_err = otl_runtime_settings_init();
+    if (runtime_settings_err != ESP_OK) {
+        OTL_LOGE("runtime", "Settings init failed: %s", esp_err_to_name(runtime_settings_err));
+    }
 
     // 2. WS2812 via RMT LED-Strip driver
     led_strip_config_t strip_config = {
@@ -2351,10 +3477,34 @@ void app_main(void)
     chip_temp_init();
     thermal_brightness_cap_percent = (float)MAX_BRIGHTNESS_PERCENT;
 
+#if CONFIG_OTL_WIFI_ENABLE
+    esp_err_t wifi_err = otl_net_start_wifi();
+    if (wifi_err != ESP_OK) {
+        OTL_LOGE("wifi", "Start failed: %s", esp_err_to_name(wifi_err));
+    }
+#endif
+
 #if CONFIG_OTL_CIRCADIAN_ENABLE
-    esp_err_t circadian_err = otl_circadian_start(otl_circadian_apply_cb, NULL);
+    esp_err_t circadian_err = otl_circadian_start(otl_circadian_apply_cb,
+                                                  NULL,
+                                                  otl_circadian_schedule_getter,
+                                                  NULL);
     if (circadian_err != ESP_OK) {
         OTL_LOGE("circadian", "Start failed: %s", esp_err_to_name(circadian_err));
+    }
+#endif
+
+#if CONFIG_OTL_HA_MQTT_ENABLE
+    esp_err_t mqtt_err = otl_mqtt_start();
+    if (mqtt_err != ESP_OK) {
+        OTL_LOGE("mqtt", "Start failed: %s", esp_err_to_name(mqtt_err));
+    }
+#endif
+
+#if CONFIG_OTL_HOMEKIT_ENABLE
+    esp_err_t homekit_err = otl_homekit_start();
+    if (homekit_err != ESP_OK) {
+        OTL_LOGE("homekit", "Start failed: %s", esp_err_to_name(homekit_err));
     }
 #endif
 
@@ -2369,7 +3519,11 @@ void app_main(void)
 #endif
 
     // Initial output state
+    otl_state_lock();
     update_outputs();
+    otl_state_unlock();
+
+    otl_event_emit(OTL_EVENT_LEVEL_INFO, "system", "Boot complete");
     
     OTL_LOGI("main", "Open Task Light initialization complete");
 }

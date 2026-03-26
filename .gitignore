@@ -3,6 +3,9 @@
 Printed Parts/.DS_Store
 
 # ESP-IDF build artifacts
+build-*/
 code/open-task-light/build/
+code/open-task-light/build-*/
+code/open-task-light/managed_components/
 code/open-task-light/sdkconfig
 code/open-task-light/sdkconfig.old
