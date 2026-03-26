@@ -2576,8 +2576,11 @@ static float read_ntc_temperature(void)
 // of the range, ease back off so the last few percent don't feel like a cliff.
 #define BRIGHTNESS_HOLD_SLOW_ZONE_PERCENT      15.0f
 #define BRIGHTNESS_HOLD_VERY_SLOW_ZONE_PERCENT 5.0f
+#define BRIGHTNESS_HOLD_DEEP_DIM_BLEND_ABOVE_MIN_PERCENT 3.0f
+#define BRIGHTNESS_HOLD_MIN_LANDING_ZONE_PERCENT 1.5f
 #define BRIGHTNESS_HOLD_MIN_REPEAT_MS_SLOW     15
 #define BRIGHTNESS_HOLD_MIN_REPEAT_MS_VERY_SLOW 25
+#define BRIGHTNESS_HOLD_MIN_REPEAT_MS_LANDING   40
 // Extra fine control below MIN_BRIGHTNESS_PERCENT (deep dim range).
 #define BRIGHTNESS_HOLD_MIN_REPEAT_MS_DEEP_DIM 150
 
@@ -2652,6 +2655,20 @@ static inline float brightness_end_min_repeat_ms(float dist_to_limit_percent)
     return lerpf(slow_ms, 0.0f, t);
 }
 
+static inline float brightness_min_landing_repeat_ms(float dist_to_limit_percent)
+{
+    float dist = dist_to_limit_percent;
+    if (dist < 0.0f) dist = 0.0f;
+
+    float zone = BRIGHTNESS_HOLD_MIN_LANDING_ZONE_PERCENT;
+    if (zone <= 0.0f || dist >= zone) {
+        return 0.0f;
+    }
+
+    float t = smoothstep01(dist / zone);
+    return lerpf((float)BRIGHTNESS_HOLD_MIN_REPEAT_MS_LANDING, 0.0f, t);
+}
+
 static inline float brightness_deep_dim_min_repeat_ms(float b_percent)
 {
     // Below MIN_BRIGHTNESS_PERCENT, we want extra fine control, but we also want
@@ -2676,7 +2693,7 @@ static inline float brightness_deep_dim_min_repeat_ms(float b_percent)
     }
 
     // Blend out the extra deep-dim slowdown over the next few percent above MIN.
-    float blend_end = min_b + BRIGHTNESS_HOLD_VERY_SLOW_ZONE_PERCENT; // 5% -> 10%
+    float blend_end = min_b + BRIGHTNESS_HOLD_DEEP_DIM_BLEND_ABOVE_MIN_PERCENT; // 5% -> 8%
     if (b < blend_end) {
         float t = smoothstep01((b - min_b) / (blend_end - min_b));
         return lerpf(very_slow_ms, 0.0f, t);
@@ -2998,6 +3015,12 @@ static void touch_task(void *arg)
                         float end_min_ms = brightness_end_min_repeat_ms(dist_to_limit);
                         if (end_min_ms > effective_repeat_ms) {
                             effective_repeat_ms = end_min_ms;
+                        }
+                        if (i == 2 && dim_down_hold_clamp_at_min) {
+                            float landing_ms = brightness_min_landing_repeat_ms(dist_to_limit);
+                            if (landing_ms > effective_repeat_ms) {
+                                effective_repeat_ms = landing_ms;
+                            }
                         }
 
                         float deep_min_ms = brightness_deep_dim_min_repeat_ms(state.brightness_percent);
