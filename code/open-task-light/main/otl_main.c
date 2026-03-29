@@ -1232,6 +1232,7 @@ static void update_outputs(void);
 #define OTL_MAX_SETTINGS_LISTENERS  4
 #define OTL_MAX_EVENT_LISTENERS     4
 #define OTL_RUNTIME_SETTINGS_NAMESPACE "otl_runtime"
+#define OTL_RUNTIME_KEY_RADAR_BT_DISABLED "radar_bt_off"
 #define OTL_RUNTIME_KEY_CIRCADIAN_ENABLED "circ_en"
 #define OTL_RUNTIME_KEY_CIRCADIAN_COOL    "circ_cool"
 #define OTL_RUNTIME_KEY_CIRCADIAN_WARM    "circ_warm"
@@ -1542,6 +1543,197 @@ static esp_err_t otl_runtime_save_str(const char *key, const char *value)
     nvs_close(handle);
     return err;
 }
+
+#if CONFIG_OTL_PRESENCE_SENSOR && CONFIG_OTL_RADAR_DISABLE_BLUETOOTH_AT_BOOT
+static esp_err_t radar_bluetooth_disable_required(bool *required)
+{
+    if (required == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *required = true;
+
+    esp_err_t err = otl_runtime_nvs_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    nvs_handle_t handle = 0;
+    err = nvs_open(OTL_RUNTIME_SETTINGS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    uint8_t stored = 0;
+    err = nvs_get_u8(handle, OTL_RUNTIME_KEY_RADAR_BT_DISABLED, &stored);
+    nvs_close(handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    *required = (stored == 0U);
+    return ESP_OK;
+}
+
+static esp_err_t radar_wait_for_ack(uint8_t expected_cmd_low, TickType_t timeout_ticks)
+{
+    uint8_t ack_buf[64];
+    size_t ack_len = 0;
+    TickType_t deadline = xTaskGetTickCount() + timeout_ticks;
+
+    while ((int32_t) (deadline - xTaskGetTickCount()) >= 0) {
+        TickType_t remaining = deadline - xTaskGetTickCount();
+        TickType_t read_timeout = remaining > pdMS_TO_TICKS(20) ? pdMS_TO_TICKS(20) : remaining;
+        if (read_timeout == 0) {
+            read_timeout = 1;
+        }
+
+        int bytes_read = uart_read_bytes(RADAR_UART_NUM,
+                                         ack_buf + ack_len,
+                                         sizeof(ack_buf) - ack_len,
+                                         read_timeout);
+        if (bytes_read > 0) {
+            ack_len += (size_t) bytes_read;
+        }
+
+        size_t i = 0;
+        while (i + 10 <= ack_len) {
+            if (!(ack_buf[i] == 0xFD &&
+                  ack_buf[i + 1] == 0xFC &&
+                  ack_buf[i + 2] == 0xFB &&
+                  ack_buf[i + 3] == 0xFA)) {
+                ++i;
+                continue;
+            }
+
+            uint16_t payload_len = (uint16_t) ack_buf[i + 4] |
+                                   ((uint16_t) ack_buf[i + 5] << 8);
+            size_t frame_len = (size_t) payload_len + 10U;
+            if (i + frame_len > ack_len) {
+                break;
+            }
+
+            if (!(ack_buf[i + frame_len - 4] == 0x04 &&
+                  ack_buf[i + frame_len - 3] == 0x03 &&
+                  ack_buf[i + frame_len - 2] == 0x02 &&
+                  ack_buf[i + frame_len - 1] == 0x01)) {
+                ++i;
+                continue;
+            }
+
+            const uint8_t *frame = &ack_buf[i];
+            if (frame[6] == expected_cmd_low && frame[7] == 0x01) {
+                uint16_t status = (uint16_t) frame[8] | ((uint16_t) frame[9] << 8);
+                return status == 0U ? ESP_OK : ESP_FAIL;
+            }
+
+            size_t remain = ack_len - (i + frame_len);
+            if (remain > 0) {
+                memmove(ack_buf, &ack_buf[i + frame_len], remain);
+            }
+            ack_len = remain;
+            i = 0;
+        }
+
+        if (i > 0 && i < ack_len) {
+            memmove(ack_buf, &ack_buf[i], ack_len - i);
+            ack_len -= i;
+        } else if (i >= ack_len) {
+            ack_len = 0;
+        }
+    }
+
+    return ESP_ERR_TIMEOUT;
+}
+
+static esp_err_t radar_send_command_with_ack(const uint8_t *frame,
+                                             size_t frame_len,
+                                             uint8_t expected_cmd_low,
+                                             TickType_t timeout_ticks)
+{
+    ESP_RETURN_ON_ERROR(uart_flush_input(RADAR_UART_NUM), "radar", "Failed to flush radar RX");
+
+    int bytes_written = uart_write_bytes(RADAR_UART_NUM, frame, frame_len);
+    if (bytes_written != (int) frame_len) {
+        return ESP_FAIL;
+    }
+
+    ESP_RETURN_ON_ERROR(uart_wait_tx_done(RADAR_UART_NUM, pdMS_TO_TICKS(100)), "radar", "Failed to drain radar TX");
+    return radar_wait_for_ack(expected_cmd_low, timeout_ticks);
+}
+
+static esp_err_t radar_disable_bluetooth_if_needed(void)
+{
+    bool disable_required = true;
+    esp_err_t err = radar_bluetooth_disable_required(&disable_required);
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (!disable_required) {
+        return ESP_OK;
+    }
+
+    static const uint8_t radar_cmd_enter_config[] = {
+        0xFD, 0xFC, 0xFB, 0xFA, 0x04, 0x00, 0xFF, 0x00, 0x01, 0x00, 0x04, 0x03, 0x02, 0x01
+    };
+    static const uint8_t radar_cmd_disable_bluetooth[] = {
+        0xFD, 0xFC, 0xFB, 0xFA, 0x04, 0x00, 0xA4, 0x00, 0x00, 0x00, 0x04, 0x03, 0x02, 0x01
+    };
+    static const uint8_t radar_cmd_restart[] = {
+        0xFD, 0xFC, 0xFB, 0xFA, 0x02, 0x00, 0xA3, 0x00, 0x04, 0x03, 0x02, 0x01
+    };
+    static const uint8_t radar_cmd_end_config[] = {
+        0xFD, 0xFC, 0xFB, 0xFA, 0x02, 0x00, 0xFE, 0x00, 0x04, 0x03, 0x02, 0x01
+    };
+
+    OTL_LOGI("radar", "Disabling LD2410B Bluetooth");
+
+    err = radar_send_command_with_ack(radar_cmd_enter_config,
+                                      sizeof(radar_cmd_enter_config),
+                                      0xFF,
+                                      pdMS_TO_TICKS(250));
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = radar_send_command_with_ack(radar_cmd_disable_bluetooth,
+                                      sizeof(radar_cmd_disable_bluetooth),
+                                      0xA4,
+                                      pdMS_TO_TICKS(250));
+    if (err != ESP_OK) {
+        (void) radar_send_command_with_ack(radar_cmd_end_config,
+                                           sizeof(radar_cmd_end_config),
+                                           0xFE,
+                                           pdMS_TO_TICKS(250));
+        return err;
+    }
+
+    err = radar_send_command_with_ack(radar_cmd_restart,
+                                      sizeof(radar_cmd_restart),
+                                      0xA3,
+                                      pdMS_TO_TICKS(500));
+    if (err != ESP_OK) {
+        (void) radar_send_command_with_ack(radar_cmd_end_config,
+                                           sizeof(radar_cmd_end_config),
+                                           0xFE,
+                                           pdMS_TO_TICKS(250));
+        return err;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(200));
+    ESP_RETURN_ON_ERROR(uart_flush_input(RADAR_UART_NUM), "radar", "Failed to flush radar RX after restart");
+    radar_rx_len = 0;
+    memset(&radar_last_sample, 0, sizeof(radar_last_sample));
+
+    return otl_runtime_save_u8(OTL_RUNTIME_KEY_RADAR_BT_DISABLED, 1U);
+}
+#endif
 
 static esp_err_t otl_runtime_settings_init(void)
 {
@@ -3441,6 +3633,12 @@ void app_main(void)
                                  RADAR_RX_GPIO,  // RX <- radar TX
                                  UART_PIN_NO_CHANGE,
                                  UART_PIN_NO_CHANGE));
+#if CONFIG_OTL_RADAR_DISABLE_BLUETOOTH_AT_BOOT
+    esp_err_t radar_bt_err = radar_disable_bluetooth_if_needed();
+    if (radar_bt_err != ESP_OK) {
+        OTL_LOGW("radar", "LD2410B Bluetooth disable failed: %s", esp_err_to_name(radar_bt_err));
+    }
+#endif
 #endif
 
     // 4. Touch pads - dynamic baseline / threshold (value rises on touch)

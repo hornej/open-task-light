@@ -194,6 +194,16 @@ config OTL_LOG_RADAR_STATUS
         distances). Disable to keep serial output quiet while still using
         presence-based dimming behavior.
 
+config OTL_RADAR_DISABLE_BLUETOOTH_AT_BOOT
+    bool "Disable LD2410B Bluetooth on first successful boot"
+    default y
+    help
+        Sends the LD2410B UART command to disable the onboard Bluetooth radio.
+        The radar stores this setting internally, and the firmware records a
+        successful disable in NVS so the radar is not restarted again on every
+        boot. Re-enable Bluetooth manually with the module's documented
+        power-cycle recovery sequence if you need app access later.
+
 menu "Radar detection"
 
 config OTL_RADAR_MOVING_MAX_DISTANCE_CM

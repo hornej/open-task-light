@@ -109,7 +109,8 @@ Under `Open Task Light`, the important sections are:
   - `Enable Home Assistant via MQTT`
   - `Enable Apple Home via HomeKit`
 - `Presence sensor`
-  - LD2410B enable, distance thresholds, on/off delay, polling interval
+  - LD2410B enable, optional first-boot Bluetooth disable, distance thresholds,
+    on/off delay, polling interval
 - `PWM`
   - non-overlapping warm/cool PWM
 - `Circadian lighting`
