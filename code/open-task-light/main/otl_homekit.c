@@ -269,7 +269,7 @@ static esp_err_t otl_homekit_init_accessory(void)
     uint8_t product_data[8] = {'O', 'T', 'L', 'L', 'I', 'G', 'H', 'T'};
     hap_acc_cfg_t cfg = {
         .name = CONFIG_OTL_HOMEKIT_ACCESSORY_NAME,
-        .manufacturer = "Open Task Light",
+        .manufacturer = "Basement Labs",
         .model = "Open Task Light",
         .serial_num = serial_num,
         .fw_rev = fw_rev,

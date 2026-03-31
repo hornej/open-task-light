@@ -14,6 +14,16 @@
 #include "freertos/semphr.h"
 #include "esp_check.h"
 #include "esp_log.h"
+
+static bool otl_runtime_status_logging_enabled(void);
+static bool otl_runtime_sensor_debug_logging_enabled(void);
+static bool otl_runtime_touch_event_logging_enabled(void);
+static bool otl_runtime_touch_calibration_logging_enabled(void);
+static bool otl_runtime_touch_raw_logging_enabled(void);
+static bool otl_runtime_pwm_duty_logging_enabled(void);
+static bool otl_runtime_radar_status_logging_enabled(void);
+static bool otl_runtime_occupancy_auto_off_enabled(void);
+
 #if CONFIG_OTL_SERIAL_OUTPUT
 #define OTL_LOGI(tag, fmt, ...) ESP_LOGI(tag, fmt, ##__VA_ARGS__)
 #define OTL_LOGW(tag, fmt, ...) ESP_LOGW(tag, fmt, ##__VA_ARGS__)
@@ -31,26 +41,42 @@
 #define OTL_LOGI_PERIODIC(tag, fmt, ...) do { (void)(tag); (void)(fmt); } while (0)
 #endif
 
-#if CONFIG_OTL_SERIAL_OUTPUT && CONFIG_OTL_LOG_STATUS
-#define OTL_LOG_STATUSI(fmt, ...) OTL_LOGI_PERIODIC("sensor", fmt, ##__VA_ARGS__)
+#if CONFIG_OTL_SERIAL_OUTPUT
+#define OTL_LOG_STATUSI(fmt, ...) do { \
+    if (otl_runtime_status_logging_enabled()) { \
+        OTL_LOGI_PERIODIC("sensor", fmt, ##__VA_ARGS__); \
+    } \
+} while (0)
 #else
 #define OTL_LOG_STATUSI(fmt, ...) do { (void)(fmt); } while (0)
 #endif
 
-#if CONFIG_OTL_SERIAL_OUTPUT && CONFIG_OTL_LOG_TOUCH_EVENTS
-#define OTL_LOG_TOUCHI(fmt, ...) OTL_LOGI("touch", fmt, ##__VA_ARGS__)
+#if CONFIG_OTL_SERIAL_OUTPUT
+#define OTL_LOG_TOUCHI(fmt, ...) do { \
+    if (otl_runtime_touch_event_logging_enabled()) { \
+        OTL_LOGI("touch", fmt, ##__VA_ARGS__); \
+    } \
+} while (0)
 #else
 #define OTL_LOG_TOUCHI(fmt, ...) do { (void)(fmt); } while (0)
 #endif
 
-#if CONFIG_OTL_SERIAL_OUTPUT && CONFIG_OTL_LOG_TOUCH_CAL
-#define OTL_LOG_TOUCH_CALI(fmt, ...) OTL_LOGI_PERIODIC("touch", fmt, ##__VA_ARGS__)
+#if CONFIG_OTL_SERIAL_OUTPUT
+#define OTL_LOG_TOUCH_CALI(fmt, ...) do { \
+    if (otl_runtime_touch_calibration_logging_enabled()) { \
+        OTL_LOGI_PERIODIC("touch", fmt, ##__VA_ARGS__); \
+    } \
+} while (0)
 #else
 #define OTL_LOG_TOUCH_CALI(fmt, ...) do { (void)(fmt); } while (0)
 #endif
 
-#if CONFIG_OTL_SERIAL_OUTPUT && CONFIG_OTL_LOG_RADAR_STATUS
-#define OTL_LOG_RADARI(fmt, ...) OTL_LOGI_PERIODIC("radar", fmt, ##__VA_ARGS__)
+#if CONFIG_OTL_SERIAL_OUTPUT
+#define OTL_LOG_RADARI(fmt, ...) do { \
+    if (otl_runtime_radar_status_logging_enabled()) { \
+        OTL_LOGI_PERIODIC("radar", fmt, ##__VA_ARGS__); \
+    } \
+} while (0)
 #else
 #define OTL_LOG_RADARI(fmt, ...) do { (void)(fmt); } while (0)
 #endif
@@ -592,10 +618,73 @@ static float temp_ratio_user_offset = 0.0f;   // applied on top of circadian_bas
 #define OTL_RUNTIME_DEFAULT_CIRCADIAN_COOLEST_TIME "11:00"
 #define OTL_RUNTIME_DEFAULT_CIRCADIAN_WARMEST_TIME "23:00"
 #endif
+
+#ifdef CONFIG_OTL_LOG_STATUS
+#define OTL_RUNTIME_DEFAULT_STATUS_LOGGING_ENABLED true
+#else
+#define OTL_RUNTIME_DEFAULT_STATUS_LOGGING_ENABLED false
+#endif
+
+#ifdef CONFIG_OTL_SENSOR_DEBUG
+#define OTL_RUNTIME_DEFAULT_SENSOR_DEBUG_LOGGING_ENABLED true
+#else
+#define OTL_RUNTIME_DEFAULT_SENSOR_DEBUG_LOGGING_ENABLED false
+#endif
+
+#ifdef CONFIG_OTL_LOG_TOUCH_EVENTS
+#define OTL_RUNTIME_DEFAULT_TOUCH_EVENT_LOGGING_ENABLED true
+#else
+#define OTL_RUNTIME_DEFAULT_TOUCH_EVENT_LOGGING_ENABLED false
+#endif
+
+#ifdef CONFIG_OTL_LOG_TOUCH_CAL
+#define OTL_RUNTIME_DEFAULT_TOUCH_CAL_LOGGING_ENABLED true
+#else
+#define OTL_RUNTIME_DEFAULT_TOUCH_CAL_LOGGING_ENABLED false
+#endif
+
+#ifdef CONFIG_OTL_LOG_TOUCH_RAW
+#define OTL_RUNTIME_DEFAULT_TOUCH_RAW_LOGGING_ENABLED true
+#define OTL_RUNTIME_TOUCH_RAW_LOG_INTERVAL_MS ((uint32_t)CONFIG_OTL_TOUCH_RAW_LOG_INTERVAL_MS)
+#else
+#define OTL_RUNTIME_DEFAULT_TOUCH_RAW_LOGGING_ENABLED false
+#define OTL_RUNTIME_TOUCH_RAW_LOG_INTERVAL_MS 200U
+#endif
+
+#ifdef CONFIG_OTL_LOG_PWM_DUTY
+#define OTL_RUNTIME_DEFAULT_PWM_DUTY_LOGGING_ENABLED true
+#define OTL_RUNTIME_PWM_LOG_INTERVAL_MS ((uint32_t)CONFIG_OTL_PWM_LOG_INTERVAL_MS)
+#else
+#define OTL_RUNTIME_DEFAULT_PWM_DUTY_LOGGING_ENABLED false
+#define OTL_RUNTIME_PWM_LOG_INTERVAL_MS 50U
+#endif
+
+#ifdef CONFIG_OTL_LOG_RADAR_STATUS
+#define OTL_RUNTIME_DEFAULT_RADAR_STATUS_LOGGING_ENABLED true
+#else
+#define OTL_RUNTIME_DEFAULT_RADAR_STATUS_LOGGING_ENABLED false
+#endif
+
+#define OTL_RUNTIME_DEFAULT_OCCUPANCY_AUTO_OFF_ENABLED true
+#define OTL_RUNTIME_DEFAULT_RADAR_MOTION_MAX_DISTANCE_CM ((uint16_t)CONFIG_OTL_RADAR_MOVING_MAX_DISTANCE_CM)
+#define OTL_RUNTIME_DEFAULT_RADAR_STATIONARY_MAX_DISTANCE_CM ((uint16_t)CONFIG_OTL_RADAR_STATIONARY_MAX_DISTANCE_CM)
+#define OTL_RUNTIME_RADAR_DISTANCE_MIN_CM 50U
+#define OTL_RUNTIME_RADAR_DISTANCE_MAX_CM 600U
+
 static bool runtime_circadian_enabled = OTL_RUNTIME_DEFAULT_CIRCADIAN_ENABLED;
 static char runtime_circadian_coolest_time[OTL_RUNTIME_TIME_STR_LEN] = OTL_RUNTIME_DEFAULT_CIRCADIAN_COOLEST_TIME;
 static char runtime_circadian_warmest_time[OTL_RUNTIME_TIME_STR_LEN] = OTL_RUNTIME_DEFAULT_CIRCADIAN_WARMEST_TIME;
 static bool runtime_verbose_diagnostics_enabled = false;
+static bool runtime_status_logging_enabled = OTL_RUNTIME_DEFAULT_STATUS_LOGGING_ENABLED;
+static bool runtime_sensor_debug_logging_enabled = OTL_RUNTIME_DEFAULT_SENSOR_DEBUG_LOGGING_ENABLED;
+static bool runtime_touch_event_logging_enabled = OTL_RUNTIME_DEFAULT_TOUCH_EVENT_LOGGING_ENABLED;
+static bool runtime_touch_calibration_logging_enabled = OTL_RUNTIME_DEFAULT_TOUCH_CAL_LOGGING_ENABLED;
+static bool runtime_touch_raw_logging_enabled = OTL_RUNTIME_DEFAULT_TOUCH_RAW_LOGGING_ENABLED;
+static bool runtime_pwm_duty_logging_enabled = OTL_RUNTIME_DEFAULT_PWM_DUTY_LOGGING_ENABLED;
+static bool runtime_radar_status_logging_enabled = OTL_RUNTIME_DEFAULT_RADAR_STATUS_LOGGING_ENABLED;
+static bool runtime_occupancy_auto_off_enabled = OTL_RUNTIME_DEFAULT_OCCUPANCY_AUTO_OFF_ENABLED;
+static uint16_t runtime_radar_motion_max_distance_cm = OTL_RUNTIME_DEFAULT_RADAR_MOTION_MAX_DISTANCE_CM;
+static uint16_t runtime_radar_stationary_max_distance_cm = OTL_RUNTIME_DEFAULT_RADAR_STATIONARY_MAX_DISTANCE_CM;
 
 static const int   BRIGHT_STEP      = 1;
 static const float TEMP_STEP        = 0.015f;
@@ -643,7 +732,7 @@ static volatile bool pwm_hold_stepper_enabled = false;
 static volatile uint32_t pwm_hold_target_total_duty = 0;
 static uint32_t pwm_hold_current_total_duty = 0;
 
-#if CONFIG_OTL_SERIAL_OUTPUT && CONFIG_OTL_LOG_PWM_DUTY
+#if CONFIG_OTL_SERIAL_OUTPUT
 static esp_timer_handle_t pwm_log_timer = NULL;
 #endif
 static SemaphoreHandle_t otl_state_mutex = NULL;
@@ -651,6 +740,13 @@ static bool radar_presence = false;
 static float telemetry_ambient_lux = NAN;
 static float telemetry_ntc_temp_c = NAN;
 static float telemetry_chip_temp_c = NAN;
+static bool telemetry_radar_motion_detected = false;
+static int telemetry_radar_motion_distance_cm = 0;
+static int telemetry_radar_stationary_distance_cm = 0;
+#if CONFIG_OTL_PRESENCE_SENSOR
+static uint32_t telemetry_radar_last_notify_ms = 0;
+static bool telemetry_radar_notify_pending = false;
+#endif
 static bool telemetry_wifi_connected = false;
 static int telemetry_wifi_rssi_dbm = 0;
 
@@ -659,6 +755,46 @@ static esp_err_t otl_runtime_settings_init(void);
 static bool otl_runtime_parse_hhmm_seconds(const char *value, int *seconds_out);
 static void otl_runtime_store_defaults_locked(void);
 static void thermal_update(float ntc_c, float chip_c);
+
+static bool otl_runtime_status_logging_enabled(void)
+{
+    return runtime_status_logging_enabled;
+}
+
+static bool otl_runtime_sensor_debug_logging_enabled(void)
+{
+    return runtime_sensor_debug_logging_enabled;
+}
+
+static bool otl_runtime_touch_event_logging_enabled(void)
+{
+    return runtime_touch_event_logging_enabled;
+}
+
+static bool otl_runtime_touch_calibration_logging_enabled(void)
+{
+    return runtime_touch_calibration_logging_enabled;
+}
+
+static bool otl_runtime_touch_raw_logging_enabled(void)
+{
+    return runtime_touch_raw_logging_enabled;
+}
+
+static bool otl_runtime_pwm_duty_logging_enabled(void)
+{
+    return runtime_pwm_duty_logging_enabled;
+}
+
+static bool otl_runtime_radar_status_logging_enabled(void)
+{
+    return runtime_radar_status_logging_enabled;
+}
+
+static bool otl_runtime_occupancy_auto_off_enabled(void)
+{
+    return runtime_occupancy_auto_off_enabled;
+}
 
 #if CONFIG_OTL_CIRCADIAN_ENABLE
 static void circadian_apply_current_ratio(void)
@@ -841,10 +977,14 @@ static void pwm_hold_stepper_set_enabled(bool enabled)
     }
 }
 
-#if CONFIG_OTL_SERIAL_OUTPUT && CONFIG_OTL_LOG_PWM_DUTY
+#if CONFIG_OTL_SERIAL_OUTPUT
 static void pwm_log_timer_cb(void *arg)
 {
     (void)arg;
+
+    if (!otl_runtime_pwm_duty_logging_enabled()) {
+        return;
+    }
 
     uint32_t warm = 0;
     uint32_t cool = 0;
@@ -910,11 +1050,10 @@ static int  saved_brightness      = 0;
 static float saved_temp_ratio_offset = 0.0f;
 static float saved_temp_ratio     = 0.5f;
 // Detection and hysteresis tuning from menuconfig -> Open Task Light -> Radar detection.
-#define RADAR_MOVING_NEAR_MAX_CM      ((uint16_t)CONFIG_OTL_RADAR_MOVING_MAX_DISTANCE_CM)
-#define RADAR_PRESENCE_MAX_DIST_CM    ((uint16_t)CONFIG_OTL_RADAR_STATIONARY_MAX_DISTANCE_CM)
 #define RADAR_PRESENCE_ON_DELAY_MS    ((uint32_t)CONFIG_OTL_RADAR_PRESENCE_ON_DELAY_MS)
 #define RADAR_ABSENCE_TIMEOUT_MS      ((uint32_t)CONFIG_OTL_RADAR_ABSENCE_TIMEOUT_MS)
 #define RADAR_TASK_LOOP_INTERVAL_MS   ((uint32_t)CONFIG_OTL_RADAR_TASK_LOOP_MS)
+#define RADAR_TELEMETRY_NOTIFY_INTERVAL_MS 1000U
 #endif
 
 // ---------------------------- Touch baseline/threshold -------------------------
@@ -1238,6 +1377,16 @@ static void update_outputs(void);
 #define OTL_RUNTIME_KEY_CIRCADIAN_WARM    "circ_warm"
 #define OTL_RUNTIME_KEY_LED_THERM_LIMIT   "led_tmax"
 #define OTL_RUNTIME_KEY_VERBOSE_DIAG      "diag_verbose"
+#define OTL_RUNTIME_KEY_STATUS_LOG        "log_status"
+#define OTL_RUNTIME_KEY_SENSOR_DEBUG      "sensor_dbg"
+#define OTL_RUNTIME_KEY_TOUCH_EVENTS      "touch_evt"
+#define OTL_RUNTIME_KEY_TOUCH_CAL         "touch_cal"
+#define OTL_RUNTIME_KEY_TOUCH_RAW         "touch_raw"
+#define OTL_RUNTIME_KEY_PWM_DUTY_LOG      "pwm_log"
+#define OTL_RUNTIME_KEY_RADAR_STATUS_LOG  "radar_log"
+#define OTL_RUNTIME_KEY_OCC_AUTO_OFF      "occ_autooff"
+#define OTL_RUNTIME_KEY_RADAR_MOTION_MAX  "rad_movmax"
+#define OTL_RUNTIME_KEY_RADAR_STATIONARY_MAX "rad_stamax"
 
 typedef struct {
     otl_state_listener_fn listener;
@@ -1321,6 +1470,9 @@ static void otl_telemetry_snapshot_locked(otl_telemetry_t *telemetry)
     telemetry->thermal_limited = thermal_ntc_hot || thermal_chip_hot;
     telemetry->thermal_ntc_hot = thermal_ntc_hot;
     telemetry->thermal_chip_hot = thermal_chip_hot;
+    telemetry->radar_motion_detected = telemetry_radar_motion_detected;
+    telemetry->radar_motion_distance_cm = telemetry_radar_motion_distance_cm;
+    telemetry->radar_stationary_distance_cm = telemetry_radar_stationary_distance_cm;
     telemetry->wifi_connected = telemetry_wifi_connected;
     telemetry->wifi_rssi_dbm = telemetry_wifi_rssi_dbm;
 }
@@ -1342,6 +1494,16 @@ static void otl_runtime_settings_snapshot_locked(otl_runtime_settings_t *setting
              runtime_circadian_warmest_time);
     settings->led_thermal_limit_c = runtime_led_thermal_limit_c;
     settings->verbose_diagnostics_enabled = runtime_verbose_diagnostics_enabled;
+    settings->status_logging_enabled = runtime_status_logging_enabled;
+    settings->sensor_debug_logging_enabled = runtime_sensor_debug_logging_enabled;
+    settings->touch_event_logging_enabled = runtime_touch_event_logging_enabled;
+    settings->touch_calibration_logging_enabled = runtime_touch_calibration_logging_enabled;
+    settings->touch_raw_logging_enabled = runtime_touch_raw_logging_enabled;
+    settings->pwm_duty_logging_enabled = runtime_pwm_duty_logging_enabled;
+    settings->radar_status_logging_enabled = runtime_radar_status_logging_enabled;
+    settings->occupancy_auto_off_enabled = runtime_occupancy_auto_off_enabled;
+    settings->radar_motion_max_distance_cm = (int)runtime_radar_motion_max_distance_cm;
+    settings->radar_stationary_max_distance_cm = (int)runtime_radar_stationary_max_distance_cm;
 }
 
 static void otl_event_snapshot_locked(otl_runtime_event_t *event)
@@ -1466,6 +1628,16 @@ static void otl_runtime_store_defaults_locked(void)
              OTL_RUNTIME_DEFAULT_CIRCADIAN_WARMEST_TIME);
     runtime_led_thermal_limit_c = OTL_THERMAL_NTC_HOT_C;
     runtime_verbose_diagnostics_enabled = false;
+    runtime_status_logging_enabled = OTL_RUNTIME_DEFAULT_STATUS_LOGGING_ENABLED;
+    runtime_sensor_debug_logging_enabled = OTL_RUNTIME_DEFAULT_SENSOR_DEBUG_LOGGING_ENABLED;
+    runtime_touch_event_logging_enabled = OTL_RUNTIME_DEFAULT_TOUCH_EVENT_LOGGING_ENABLED;
+    runtime_touch_calibration_logging_enabled = OTL_RUNTIME_DEFAULT_TOUCH_CAL_LOGGING_ENABLED;
+    runtime_touch_raw_logging_enabled = OTL_RUNTIME_DEFAULT_TOUCH_RAW_LOGGING_ENABLED;
+    runtime_pwm_duty_logging_enabled = OTL_RUNTIME_DEFAULT_PWM_DUTY_LOGGING_ENABLED;
+    runtime_radar_status_logging_enabled = OTL_RUNTIME_DEFAULT_RADAR_STATUS_LOGGING_ENABLED;
+    runtime_occupancy_auto_off_enabled = OTL_RUNTIME_DEFAULT_OCCUPANCY_AUTO_OFF_ENABLED;
+    runtime_radar_motion_max_distance_cm = OTL_RUNTIME_DEFAULT_RADAR_MOTION_MAX_DISTANCE_CM;
+    runtime_radar_stationary_max_distance_cm = OTL_RUNTIME_DEFAULT_RADAR_STATIONARY_MAX_DISTANCE_CM;
 }
 
 static esp_err_t otl_runtime_nvs_init(void)
@@ -1739,6 +1911,16 @@ static esp_err_t otl_runtime_settings_init(void)
 {
     bool circadian_enabled = OTL_RUNTIME_DEFAULT_CIRCADIAN_ENABLED;
     bool verbose_enabled = false;
+    bool status_logging_enabled = OTL_RUNTIME_DEFAULT_STATUS_LOGGING_ENABLED;
+    bool sensor_debug_logging_enabled = OTL_RUNTIME_DEFAULT_SENSOR_DEBUG_LOGGING_ENABLED;
+    bool touch_event_logging_enabled = OTL_RUNTIME_DEFAULT_TOUCH_EVENT_LOGGING_ENABLED;
+    bool touch_calibration_logging_enabled = OTL_RUNTIME_DEFAULT_TOUCH_CAL_LOGGING_ENABLED;
+    bool touch_raw_logging_enabled = OTL_RUNTIME_DEFAULT_TOUCH_RAW_LOGGING_ENABLED;
+    bool pwm_duty_logging_enabled = OTL_RUNTIME_DEFAULT_PWM_DUTY_LOGGING_ENABLED;
+    bool radar_status_logging_enabled = OTL_RUNTIME_DEFAULT_RADAR_STATUS_LOGGING_ENABLED;
+    bool occupancy_auto_off_enabled = OTL_RUNTIME_DEFAULT_OCCUPANCY_AUTO_OFF_ENABLED;
+    uint16_t radar_motion_max_distance_cm = OTL_RUNTIME_DEFAULT_RADAR_MOTION_MAX_DISTANCE_CM;
+    uint16_t radar_stationary_max_distance_cm = OTL_RUNTIME_DEFAULT_RADAR_STATIONARY_MAX_DISTANCE_CM;
     float led_thermal_limit_c = OTL_THERMAL_NTC_HOT_C;
     char coolest_time[OTL_RUNTIME_TIME_STR_LEN] = OTL_RUNTIME_DEFAULT_CIRCADIAN_COOLEST_TIME;
     char warmest_time[OTL_RUNTIME_TIME_STR_LEN] = OTL_RUNTIME_DEFAULT_CIRCADIAN_WARMEST_TIME;
@@ -1778,6 +1960,40 @@ static esp_err_t otl_runtime_settings_init(void)
         if (nvs_get_u8(handle, OTL_RUNTIME_KEY_VERBOSE_DIAG, &stored_u8) == ESP_OK) {
             verbose_enabled = (stored_u8 != 0);
         }
+        if (nvs_get_u8(handle, OTL_RUNTIME_KEY_STATUS_LOG, &stored_u8) == ESP_OK) {
+            status_logging_enabled = (stored_u8 != 0);
+        }
+        if (nvs_get_u8(handle, OTL_RUNTIME_KEY_SENSOR_DEBUG, &stored_u8) == ESP_OK) {
+            sensor_debug_logging_enabled = (stored_u8 != 0);
+        }
+        if (nvs_get_u8(handle, OTL_RUNTIME_KEY_TOUCH_EVENTS, &stored_u8) == ESP_OK) {
+            touch_event_logging_enabled = (stored_u8 != 0);
+        }
+        if (nvs_get_u8(handle, OTL_RUNTIME_KEY_TOUCH_CAL, &stored_u8) == ESP_OK) {
+            touch_calibration_logging_enabled = (stored_u8 != 0);
+        }
+        if (nvs_get_u8(handle, OTL_RUNTIME_KEY_TOUCH_RAW, &stored_u8) == ESP_OK) {
+            touch_raw_logging_enabled = (stored_u8 != 0);
+        }
+        if (nvs_get_u8(handle, OTL_RUNTIME_KEY_PWM_DUTY_LOG, &stored_u8) == ESP_OK) {
+            pwm_duty_logging_enabled = (stored_u8 != 0);
+        }
+        if (nvs_get_u8(handle, OTL_RUNTIME_KEY_RADAR_STATUS_LOG, &stored_u8) == ESP_OK) {
+            radar_status_logging_enabled = (stored_u8 != 0);
+        }
+        if (nvs_get_u8(handle, OTL_RUNTIME_KEY_OCC_AUTO_OFF, &stored_u8) == ESP_OK) {
+            occupancy_auto_off_enabled = (stored_u8 != 0);
+        }
+        if (nvs_get_u16(handle, OTL_RUNTIME_KEY_RADAR_MOTION_MAX, &stored_u16) == ESP_OK &&
+            stored_u16 >= OTL_RUNTIME_RADAR_DISTANCE_MIN_CM &&
+            stored_u16 <= OTL_RUNTIME_RADAR_DISTANCE_MAX_CM) {
+            radar_motion_max_distance_cm = stored_u16;
+        }
+        if (nvs_get_u16(handle, OTL_RUNTIME_KEY_RADAR_STATIONARY_MAX, &stored_u16) == ESP_OK &&
+            stored_u16 >= OTL_RUNTIME_RADAR_DISTANCE_MIN_CM &&
+            stored_u16 <= OTL_RUNTIME_RADAR_DISTANCE_MAX_CM) {
+            radar_stationary_max_distance_cm = stored_u16;
+        }
         if (nvs_get_u16(handle, OTL_RUNTIME_KEY_LED_THERM_LIMIT, &stored_u16) == ESP_OK) {
             float stored_limit = (float)stored_u16 / 10.0f;
             if (stored_limit >= OTL_RUNTIME_LED_THERM_LIMIT_MIN_C &&
@@ -1799,6 +2015,16 @@ static esp_err_t otl_runtime_settings_init(void)
 #endif
     runtime_led_thermal_limit_c = led_thermal_limit_c;
     runtime_verbose_diagnostics_enabled = verbose_enabled;
+    runtime_status_logging_enabled = status_logging_enabled;
+    runtime_sensor_debug_logging_enabled = sensor_debug_logging_enabled;
+    runtime_touch_event_logging_enabled = touch_event_logging_enabled;
+    runtime_touch_calibration_logging_enabled = touch_calibration_logging_enabled;
+    runtime_touch_raw_logging_enabled = touch_raw_logging_enabled;
+    runtime_pwm_duty_logging_enabled = pwm_duty_logging_enabled;
+    runtime_radar_status_logging_enabled = radar_status_logging_enabled;
+    runtime_occupancy_auto_off_enabled = occupancy_auto_off_enabled;
+    runtime_radar_motion_max_distance_cm = radar_motion_max_distance_cm;
+    runtime_radar_stationary_max_distance_cm = radar_stationary_max_distance_cm;
     otl_state_unlock();
 
     return ESP_OK;
@@ -2075,28 +2301,139 @@ bool otl_runtime_get_circadian_schedule(int *coolest_seconds, int *warmest_secon
     return true;
 }
 
-esp_err_t otl_runtime_set_verbose_diagnostics(bool enabled, otl_change_source_t source)
+static esp_err_t otl_runtime_apply_boolean_setting(bool *target,
+                                                   const char *key,
+                                                   bool enabled,
+                                                   const char *category,
+                                                   const char *enabled_message,
+                                                   const char *disabled_message,
+                                                   otl_change_source_t source)
 {
     otl_runtime_settings_t settings = {0};
 
-    ESP_RETURN_ON_ERROR(otl_runtime_save_u8(OTL_RUNTIME_KEY_VERBOSE_DIAG, enabled ? 1U : 0U),
-                        "runtime",
-                        "Failed to save verbose diagnostics setting");
+    if (target == NULL || key == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
 
-    otl_state_lock();
-    if (runtime_verbose_diagnostics_enabled == enabled) {
-        otl_state_unlock();
+    if (*target == enabled) {
         return ESP_OK;
     }
-    runtime_verbose_diagnostics_enabled = enabled;
+
+    ESP_RETURN_ON_ERROR(otl_runtime_save_u8(key, enabled ? 1U : 0U),
+                        "runtime",
+                        "Failed to save runtime boolean setting");
+
+    otl_state_lock();
+    *target = enabled;
     otl_runtime_settings_snapshot_locked(&settings);
     otl_state_unlock();
 
     otl_runtime_settings_notify_listeners(&settings, source);
-    otl_event_emit(OTL_EVENT_LEVEL_INFO,
-                   "diagnostics",
-                   enabled ? "Verbose diagnostics enabled" : "Verbose diagnostics disabled");
+    if (category != NULL && enabled_message != NULL && disabled_message != NULL) {
+        otl_event_emit(OTL_EVENT_LEVEL_INFO,
+                       category,
+                       enabled ? enabled_message : disabled_message);
+    }
     return ESP_OK;
+}
+
+esp_err_t otl_runtime_set_verbose_diagnostics(bool enabled, otl_change_source_t source)
+{
+    return otl_runtime_apply_boolean_setting(&runtime_verbose_diagnostics_enabled,
+                                             OTL_RUNTIME_KEY_VERBOSE_DIAG,
+                                             enabled,
+                                             "diagnostics",
+                                             "Verbose diagnostics enabled",
+                                             "Verbose diagnostics disabled",
+                                             source);
+}
+
+esp_err_t otl_runtime_set_status_logging_enabled(bool enabled, otl_change_source_t source)
+{
+    return otl_runtime_apply_boolean_setting(&runtime_status_logging_enabled,
+                                             OTL_RUNTIME_KEY_STATUS_LOG,
+                                             enabled,
+                                             "logging",
+                                             "Status logs enabled",
+                                             "Status logs disabled",
+                                             source);
+}
+
+esp_err_t otl_runtime_set_sensor_debug_logging_enabled(bool enabled, otl_change_source_t source)
+{
+    return otl_runtime_apply_boolean_setting(&runtime_sensor_debug_logging_enabled,
+                                             OTL_RUNTIME_KEY_SENSOR_DEBUG,
+                                             enabled,
+                                             "logging",
+                                             "Sensor debug logs enabled",
+                                             "Sensor debug logs disabled",
+                                             source);
+}
+
+esp_err_t otl_runtime_set_touch_event_logging_enabled(bool enabled, otl_change_source_t source)
+{
+    return otl_runtime_apply_boolean_setting(&runtime_touch_event_logging_enabled,
+                                             OTL_RUNTIME_KEY_TOUCH_EVENTS,
+                                             enabled,
+                                             "logging",
+                                             "Touch event logs enabled",
+                                             "Touch event logs disabled",
+                                             source);
+}
+
+esp_err_t otl_runtime_set_touch_calibration_logging_enabled(bool enabled, otl_change_source_t source)
+{
+    return otl_runtime_apply_boolean_setting(&runtime_touch_calibration_logging_enabled,
+                                             OTL_RUNTIME_KEY_TOUCH_CAL,
+                                             enabled,
+                                             "logging",
+                                             "Touch calibration logs enabled",
+                                             "Touch calibration logs disabled",
+                                             source);
+}
+
+esp_err_t otl_runtime_set_touch_raw_logging_enabled(bool enabled, otl_change_source_t source)
+{
+    return otl_runtime_apply_boolean_setting(&runtime_touch_raw_logging_enabled,
+                                             OTL_RUNTIME_KEY_TOUCH_RAW,
+                                             enabled,
+                                             "logging",
+                                             "Touch raw logs enabled",
+                                             "Touch raw logs disabled",
+                                             source);
+}
+
+esp_err_t otl_runtime_set_pwm_duty_logging_enabled(bool enabled, otl_change_source_t source)
+{
+    return otl_runtime_apply_boolean_setting(&runtime_pwm_duty_logging_enabled,
+                                             OTL_RUNTIME_KEY_PWM_DUTY_LOG,
+                                             enabled,
+                                             "logging",
+                                             "PWM duty logs enabled",
+                                             "PWM duty logs disabled",
+                                             source);
+}
+
+esp_err_t otl_runtime_set_radar_status_logging_enabled(bool enabled, otl_change_source_t source)
+{
+    return otl_runtime_apply_boolean_setting(&runtime_radar_status_logging_enabled,
+                                             OTL_RUNTIME_KEY_RADAR_STATUS_LOG,
+                                             enabled,
+                                             "logging",
+                                             "Radar status logs enabled",
+                                             "Radar status logs disabled",
+                                             source);
+}
+
+esp_err_t otl_runtime_set_occupancy_auto_off_enabled(bool enabled, otl_change_source_t source)
+{
+    return otl_runtime_apply_boolean_setting(&runtime_occupancy_auto_off_enabled,
+                                             OTL_RUNTIME_KEY_OCC_AUTO_OFF,
+                                             enabled,
+                                             "occupancy",
+                                             "Occupancy auto-off enabled",
+                                             "Occupancy auto-off disabled",
+                                             source);
 }
 
 esp_err_t otl_runtime_set_circadian_enabled(bool enabled, otl_change_source_t source)
@@ -2136,7 +2473,7 @@ esp_err_t otl_runtime_set_circadian_enabled(bool enabled, otl_change_source_t so
     }
     otl_event_emit(OTL_EVENT_LEVEL_INFO,
                    "circadian",
-                   enabled ? "Firmware circadian enabled" : "Firmware circadian disabled");
+                   enabled ? "Circadian lighting enabled" : "Circadian lighting disabled");
     return ESP_OK;
 #else
     (void)enabled;
@@ -2239,6 +2576,66 @@ esp_err_t otl_runtime_set_led_thermal_limit_c(float limit_c, otl_change_source_t
     return ESP_OK;
 }
 
+esp_err_t otl_runtime_set_radar_motion_max_distance_cm(int limit_cm, otl_change_source_t source)
+{
+    otl_runtime_settings_t settings = {0};
+    char event_message[OTL_RUNTIME_EVENT_MESSAGE_LEN] = {0};
+    uint16_t normalized_limit = (uint16_t)limit_cm;
+
+    if (limit_cm < (int)OTL_RUNTIME_RADAR_DISTANCE_MIN_CM ||
+        limit_cm > (int)OTL_RUNTIME_RADAR_DISTANCE_MAX_CM) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_RETURN_ON_ERROR(otl_runtime_save_u16(OTL_RUNTIME_KEY_RADAR_MOTION_MAX, normalized_limit),
+                        "runtime",
+                        "Failed to save radar motion max distance");
+
+    otl_state_lock();
+    if (runtime_radar_motion_max_distance_cm == normalized_limit) {
+        otl_state_unlock();
+        return ESP_OK;
+    }
+    runtime_radar_motion_max_distance_cm = normalized_limit;
+    otl_runtime_settings_snapshot_locked(&settings);
+    otl_state_unlock();
+
+    otl_runtime_settings_notify_listeners(&settings, source);
+    snprintf(event_message, sizeof(event_message), "Updated motion max distance to %dcm", limit_cm);
+    otl_event_emit(OTL_EVENT_LEVEL_INFO, "occupancy", event_message);
+    return ESP_OK;
+}
+
+esp_err_t otl_runtime_set_radar_stationary_max_distance_cm(int limit_cm, otl_change_source_t source)
+{
+    otl_runtime_settings_t settings = {0};
+    char event_message[OTL_RUNTIME_EVENT_MESSAGE_LEN] = {0};
+    uint16_t normalized_limit = (uint16_t)limit_cm;
+
+    if (limit_cm < (int)OTL_RUNTIME_RADAR_DISTANCE_MIN_CM ||
+        limit_cm > (int)OTL_RUNTIME_RADAR_DISTANCE_MAX_CM) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_RETURN_ON_ERROR(otl_runtime_save_u16(OTL_RUNTIME_KEY_RADAR_STATIONARY_MAX, normalized_limit),
+                        "runtime",
+                        "Failed to save radar stationary max distance");
+
+    otl_state_lock();
+    if (runtime_radar_stationary_max_distance_cm == normalized_limit) {
+        otl_state_unlock();
+        return ESP_OK;
+    }
+    runtime_radar_stationary_max_distance_cm = normalized_limit;
+    otl_runtime_settings_snapshot_locked(&settings);
+    otl_state_unlock();
+
+    otl_runtime_settings_notify_listeners(&settings, source);
+    snprintf(event_message, sizeof(event_message), "Updated stationary max distance to %dcm", limit_cm);
+    otl_event_emit(OTL_EVENT_LEVEL_INFO, "occupancy", event_message);
+    return ESP_OK;
+}
+
 const char *otl_event_level_to_string(otl_event_level_t level)
 {
     switch (level) {
@@ -2323,6 +2720,59 @@ static bool otl_telemetry_update(float lux,
     }
 
     return changed;
+}
+
+static bool otl_telemetry_update_radar(bool motion_detected,
+                                       int motion_distance_cm,
+                                       int stationary_distance_cm)
+{
+    bool changed = false;
+    bool should_notify = false;
+    otl_telemetry_t telemetry = {0};
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+    if (motion_distance_cm < 0) {
+        motion_distance_cm = 0;
+    }
+    if (stationary_distance_cm < 0) {
+        stationary_distance_cm = 0;
+    }
+
+    otl_state_lock();
+    if (telemetry_radar_motion_detected != motion_detected) {
+        telemetry_radar_motion_detected = motion_detected;
+        changed = true;
+    }
+    if (telemetry_radar_motion_distance_cm != motion_distance_cm) {
+        telemetry_radar_motion_distance_cm = motion_distance_cm;
+        changed = true;
+    }
+    if (telemetry_radar_stationary_distance_cm != stationary_distance_cm) {
+        telemetry_radar_stationary_distance_cm = stationary_distance_cm;
+        changed = true;
+    }
+
+    if (changed) {
+        telemetry_radar_notify_pending = true;
+    }
+
+    // Keep radar sensing responsive, but coalesce HA-facing telemetry updates to
+    // roughly once per second so small distance jitter does not spam MQTT.
+    if (telemetry_radar_notify_pending &&
+        (telemetry_radar_last_notify_ms == 0 ||
+         (now_ms - telemetry_radar_last_notify_ms) >= RADAR_TELEMETRY_NOTIFY_INTERVAL_MS)) {
+        otl_telemetry_snapshot_locked(&telemetry);
+        telemetry_radar_last_notify_ms = now_ms;
+        telemetry_radar_notify_pending = false;
+        should_notify = true;
+    }
+    otl_state_unlock();
+
+    if (should_notify) {
+        otl_telemetry_notify_listeners(&telemetry);
+    }
+
+    return changed || should_notify;
 }
 
 static void thermal_update(float ntc_c, float chip_c)
@@ -2476,6 +2926,11 @@ static void handle_occupancy_lost(void)
 
     otl_state_lock();
     radar_occupied = false;
+
+    if (!otl_runtime_occupancy_auto_off_enabled()) {
+        otl_state_unlock();
+        return;
+    }
 
     // Only fade out if the light is currently on and
     // we haven't already faded it out.
@@ -2683,17 +3138,17 @@ static float __attribute__((unused)) read_als_lux(void)
     int raw = 0;
     esp_err_t err = adc_oneshot_read(adc1_handle, als_channel, &raw);
     if (err != ESP_OK) {
-#if CONFIG_OTL_SENSOR_DEBUG
-        OTL_LOGW("sensor", "ALS read failed: %s", esp_err_to_name(err));
-#endif
+        if (otl_runtime_sensor_debug_logging_enabled()) {
+            OTL_LOGW("sensor", "ALS read failed: %s", esp_err_to_name(err));
+        }
         return 0.0f;  // Return safe default on error
     }
     float voltage = (raw / 4095.0f) * 3.3f;
     float iph_uA  = (voltage / 10000.0f) * 1e6f;
     float lux = (iph_uA / 100.0f) * 1000.0f;
-#if CONFIG_OTL_SENSOR_DEBUG
-    OTL_LOGI_PERIODIC("sensor", "ALS raw=%d V=%.3fV Iph=%.1fuA lux=%.1f", raw, voltage, iph_uA, lux);
-#endif
+    if (otl_runtime_sensor_debug_logging_enabled()) {
+        OTL_LOGI_PERIODIC("sensor", "ALS raw=%d V=%.3fV Iph=%.1fuA lux=%.1f", raw, voltage, iph_uA, lux);
+    }
     return lux;
 }
 
@@ -2726,9 +3181,9 @@ static float read_ntc_temperature_sample(void)
 
     float r  = series_resistor * (v / (3.3f - v));
 
-#if CONFIG_OTL_SENSOR_DEBUG
-    OTL_LOGI_PERIODIC("sensor", "NTC raw=%d V=%.3fV R=%.1fohm", raw, v, r);
-#endif
+    if (otl_runtime_sensor_debug_logging_enabled()) {
+        OTL_LOGI_PERIODIC("sensor", "NTC raw=%d V=%.3fV R=%.1fohm", raw, v, r);
+    }
 
     if (r <= 0) return NAN;
 
@@ -2938,9 +3393,9 @@ static void touch_task(void *arg)
             }
         }
 
-#if CONFIG_OTL_SERIAL_OUTPUT && CONFIG_OTL_LOG_TOUCH_RAW
         static uint32_t last_touch_raw_log_ms = 0;
-        if ((now - last_touch_raw_log_ms) >= (uint32_t)CONFIG_OTL_TOUCH_RAW_LOG_INTERVAL_MS) {
+        if (otl_runtime_touch_raw_logging_enabled() &&
+            (now - last_touch_raw_log_ms) >= OTL_RUNTIME_TOUCH_RAW_LOG_INTERVAL_MS) {
             last_touch_raw_log_ms = now;
             OTL_LOGI_PERIODIC("touch_raw",
                               "PWR=%lu/%lu B+=%lu/%lu B-=%lu/%lu T+=%lu/%lu T-=%lu/%lu",
@@ -2950,7 +3405,6 @@ static void touch_task(void *arg)
                               (unsigned long)raw_now[3], (unsigned long)threshold[3],
                               (unsigned long)raw_now[4], (unsigned long)threshold[4]);
         }
-#endif
 
         // --- LED ON/OFF + optional NeoPixel enable on long-hold ---
         // NeoPixel is always off by default. To enable it, turn the light on
@@ -3361,15 +3815,18 @@ static void radar_task(void *arg)
         // condition has held for RADAR_ABSENCE_TIMEOUT_MS.
         moving = radar_last_sample.valid &&
                  (radar_last_sample.movingDist > 0) &&
-                 (radar_last_sample.movingDist <= RADAR_MOVING_NEAR_MAX_CM);
+                 (radar_last_sample.movingDist <= runtime_radar_motion_max_distance_cm);
         stationary = radar_last_sample.valid &&
                      (radar_last_sample.staticDist > 0) &&
-                     (radar_last_sample.staticDist <= RADAR_PRESENCE_MAX_DIST_CM);
+                     (radar_last_sample.staticDist <= runtime_radar_stationary_max_distance_cm);
 
         // Presence is based solely on distances (movDist/statDist) within the
         // configured range. We do NOT use the OUT pin for dimming, since it
         // can stay high even when the person has left the near field.
         bool new_presence = moving || stationary;
+        (void)otl_telemetry_update_radar(moving,
+                                         radar_last_sample.valid ? (int)radar_last_sample.movingDist : 0,
+                                         radar_last_sample.valid ? (int)radar_last_sample.staticDist : 0);
 
         uint32_t now_ms = esp_timer_get_time() / 1000;
 
@@ -3434,7 +3891,7 @@ static void sensor_task(void *arg)
     (void)arg;
     TickType_t last_wake = xTaskGetTickCount();
     uint32_t verbose_diag_elapsed_ms = SENSOR_READ_INTERVAL_MS;
-#if CONFIG_OTL_SERIAL_OUTPUT && (CONFIG_OTL_LOG_STATUS || CONFIG_OTL_SENSOR_DEBUG)
+#if CONFIG_OTL_SERIAL_OUTPUT
     uint32_t log_elapsed_ms = SENSOR_READ_INTERVAL_MS;
 #endif
 
@@ -3471,13 +3928,13 @@ static void sensor_task(void *arg)
             otl_event_emit(OTL_EVENT_LEVEL_INFO, "diagnostics", event_message);
         }
 
-#if CONFIG_OTL_SERIAL_OUTPUT && (CONFIG_OTL_LOG_STATUS || CONFIG_OTL_SENSOR_DEBUG)
+#if CONFIG_OTL_SERIAL_OUTPUT
         log_elapsed_ms += THERMAL_POLL_INTERVAL_MS;
-        if (log_elapsed_ms >= SENSOR_READ_INTERVAL_MS) {
+        if (log_elapsed_ms >= SENSOR_READ_INTERVAL_MS &&
+            (otl_runtime_status_logging_enabled() || otl_runtime_sensor_debug_logging_enabled())) {
             otl_public_state_t state = {0};
             log_elapsed_ms = 0;
             otl_state_get_public(&state);
-#if CONFIG_OTL_LOG_STATUS
             const char *light_state = state.is_on ? "ON" : "OFF";
             float temp_cool_ratio = state.temp_ratio;
             float temp_warm_ratio = 1.0f - state.temp_ratio;
@@ -3501,9 +3958,6 @@ static void sensor_task(void *arg)
                                 lux,
                                 ntc_temp);
             }
-#else
-            (void)lux;
-#endif
         }
 #endif
 
@@ -3568,7 +4022,7 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_timer_start_periodic(pwm_nonoverlap_timer, PWM_SOFT_FADE_UPDATE_US));
 #endif
 
-#if CONFIG_OTL_SERIAL_OUTPUT && CONFIG_OTL_LOG_PWM_DUTY
+#if CONFIG_OTL_SERIAL_OUTPUT
     const esp_timer_create_args_t pwm_log_timer_args = {
         .callback = &pwm_log_timer_cb,
         .arg = NULL,
@@ -3577,7 +4031,8 @@ void app_main(void)
         .skip_unhandled_events = true,
     };
     ESP_ERROR_CHECK(esp_timer_create(&pwm_log_timer_args, &pwm_log_timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(pwm_log_timer, (uint64_t)CONFIG_OTL_PWM_LOG_INTERVAL_MS * 1000ULL));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(pwm_log_timer,
+                                             (uint64_t)OTL_RUNTIME_PWM_LOG_INTERVAL_MS * 1000ULL));
 #endif
 
     otl_state_mutex = xSemaphoreCreateMutex();

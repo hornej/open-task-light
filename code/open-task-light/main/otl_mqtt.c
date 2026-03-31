@@ -12,6 +12,7 @@
 
 #if CONFIG_OTL_HA_MQTT_ENABLE
 
+#include "otl_build_info.h"
 #include "esp_app_desc.h"
 #include "esp_check.h"
 #include "esp_log.h"
@@ -30,6 +31,7 @@ static const char *TAG = "otl_mqtt";
 #define OTL_MQTT_COOL_KELVIN         5000.0f
 #define OTL_MQTT_WARM_MIRED          (1000000.0f / OTL_MQTT_WARM_KELVIN)
 #define OTL_MQTT_COOL_MIRED          (1000000.0f / OTL_MQTT_COOL_KELVIN)
+#define OTL_MQTT_CM_PER_FOOT         30.48f
 #define OTL_MQTT_TASK_NAME           "otl_mqtt"
 #define OTL_MQTT_TASK_STACK_SIZE     6144
 #define OTL_MQTT_TASK_PRIORITY       4
@@ -57,6 +59,12 @@ typedef struct {
 #if CONFIG_OTL_PRESENCE_SENSOR
     char occupancy_state_topic[OTL_MQTT_TOPIC_MAX];
     char occupancy_discovery_topic[OTL_MQTT_TOPIC_MAX];
+    char motion_state_topic[OTL_MQTT_TOPIC_MAX];
+    char motion_discovery_topic[OTL_MQTT_TOPIC_MAX];
+    char motion_distance_state_topic[OTL_MQTT_TOPIC_MAX];
+    char motion_distance_discovery_topic[OTL_MQTT_TOPIC_MAX];
+    char stationary_distance_state_topic[OTL_MQTT_TOPIC_MAX];
+    char stationary_distance_discovery_topic[OTL_MQTT_TOPIC_MAX];
 #endif
     char ambient_lux_state_topic[OTL_MQTT_TOPIC_MAX];
     char ambient_lux_discovery_topic[OTL_MQTT_TOPIC_MAX];
@@ -87,13 +95,63 @@ typedef struct {
     char verbose_diag_state_topic[OTL_MQTT_TOPIC_MAX];
     char verbose_diag_command_topic[OTL_MQTT_TOPIC_MAX];
     char verbose_diag_discovery_topic[OTL_MQTT_TOPIC_MAX];
+    char status_log_state_topic[OTL_MQTT_TOPIC_MAX];
+    char status_log_command_topic[OTL_MQTT_TOPIC_MAX];
+    char status_log_discovery_topic[OTL_MQTT_TOPIC_MAX];
+    char sensor_debug_state_topic[OTL_MQTT_TOPIC_MAX];
+    char sensor_debug_command_topic[OTL_MQTT_TOPIC_MAX];
+    char sensor_debug_discovery_topic[OTL_MQTT_TOPIC_MAX];
+    char touch_event_log_state_topic[OTL_MQTT_TOPIC_MAX];
+    char touch_event_log_command_topic[OTL_MQTT_TOPIC_MAX];
+    char touch_event_log_discovery_topic[OTL_MQTT_TOPIC_MAX];
+    char touch_cal_log_state_topic[OTL_MQTT_TOPIC_MAX];
+    char touch_cal_log_command_topic[OTL_MQTT_TOPIC_MAX];
+    char touch_cal_log_discovery_topic[OTL_MQTT_TOPIC_MAX];
+    char touch_raw_log_state_topic[OTL_MQTT_TOPIC_MAX];
+    char touch_raw_log_command_topic[OTL_MQTT_TOPIC_MAX];
+    char touch_raw_log_discovery_topic[OTL_MQTT_TOPIC_MAX];
+    char pwm_log_state_topic[OTL_MQTT_TOPIC_MAX];
+    char pwm_log_command_topic[OTL_MQTT_TOPIC_MAX];
+    char pwm_log_discovery_topic[OTL_MQTT_TOPIC_MAX];
+#if CONFIG_OTL_PRESENCE_SENSOR
+    char radar_log_state_topic[OTL_MQTT_TOPIC_MAX];
+    char radar_log_command_topic[OTL_MQTT_TOPIC_MAX];
+    char radar_log_discovery_topic[OTL_MQTT_TOPIC_MAX];
+    char radar_motion_max_distance_state_topic[OTL_MQTT_TOPIC_MAX];
+    char radar_motion_max_distance_command_topic[OTL_MQTT_TOPIC_MAX];
+    char radar_motion_max_distance_discovery_topic[OTL_MQTT_TOPIC_MAX];
+    char radar_stationary_max_distance_state_topic[OTL_MQTT_TOPIC_MAX];
+    char radar_stationary_max_distance_command_topic[OTL_MQTT_TOPIC_MAX];
+    char radar_stationary_max_distance_discovery_topic[OTL_MQTT_TOPIC_MAX];
+    char occupancy_auto_off_state_topic[OTL_MQTT_TOPIC_MAX];
+    char occupancy_auto_off_command_topic[OTL_MQTT_TOPIC_MAX];
+    char occupancy_auto_off_discovery_topic[OTL_MQTT_TOPIC_MAX];
+#endif
+    char firmware_version_state_topic[OTL_MQTT_TOPIC_MAX];
+    char firmware_version_discovery_topic[OTL_MQTT_TOPIC_MAX];
+    char firmware_built_state_topic[OTL_MQTT_TOPIC_MAX];
+    char firmware_built_discovery_topic[OTL_MQTT_TOPIC_MAX];
+    char firmware_idf_state_topic[OTL_MQTT_TOPIC_MAX];
+    char firmware_idf_discovery_topic[OTL_MQTT_TOPIC_MAX];
+    char firmware_target_state_topic[OTL_MQTT_TOPIC_MAX];
+    char firmware_target_discovery_topic[OTL_MQTT_TOPIC_MAX];
+    char firmware_homekit_state_topic[OTL_MQTT_TOPIC_MAX];
+    char firmware_homekit_discovery_topic[OTL_MQTT_TOPIC_MAX];
+    char firmware_presence_state_topic[OTL_MQTT_TOPIC_MAX];
+    char firmware_presence_discovery_topic[OTL_MQTT_TOPIC_MAX];
+    char firmware_circadian_state_topic[OTL_MQTT_TOPIC_MAX];
+    char firmware_circadian_discovery_topic[OTL_MQTT_TOPIC_MAX];
     char last_event_state_topic[OTL_MQTT_TOPIC_MAX];
     char last_event_discovery_topic[OTL_MQTT_TOPIC_MAX];
 } otl_mqtt_ctx_t;
 
 static otl_mqtt_ctx_t s_mqtt = {0};
 
+typedef esp_err_t (*otl_mqtt_bool_setting_setter_fn)(bool enabled, otl_change_source_t source);
+
 static esp_err_t otl_mqtt_build_topics(void);
+static esp_err_t otl_mqtt_publish_discovery_payload(const char *topic, const char *payload);
+static void otl_mqtt_publish(const char *topic, const char *payload, bool retain);
 static void otl_mqtt_event_handler(void *handler_args,
                                    esp_event_base_t base,
                                    int32_t event_id,
@@ -211,6 +269,11 @@ static bool otl_mqtt_parse_on_off_payload(esp_mqtt_event_handle_t event, bool *v
     return false;
 }
 
+static void otl_mqtt_publish_bool_state(const char *topic, bool enabled)
+{
+    otl_mqtt_publish(topic, enabled ? "ON" : "OFF", true);
+}
+
 static esp_err_t otl_mqtt_format_topic(char *dst, size_t dst_size, const char *fmt, ...)
 {
     va_list args;
@@ -302,6 +365,171 @@ static char *otl_mqtt_json_escape(const char *src)
     return dst;
 }
 
+static void otl_mqtt_publish_switch(const char *name,
+                                    const char *unique_suffix,
+                                    const char *command_topic,
+                                    const char *state_topic,
+                                    const char *discovery_topic,
+                                    const char *icon,
+                                    const char *entity_category,
+                                    const char *device_json)
+{
+    char *payload = NULL;
+    const char *icon_json = "";
+
+    if (name == NULL || unique_suffix == NULL || command_topic == NULL || state_topic == NULL ||
+        discovery_topic == NULL || entity_category == NULL || device_json == NULL) {
+        return;
+    }
+
+    if (icon != NULL && icon[0] != '\0') {
+        icon_json = otl_mqtt_alloc_printf("\"icon\":\"%s\",", icon);
+        if (icon_json == NULL) {
+            return;
+        }
+    }
+
+    payload = otl_mqtt_alloc_printf(
+        "{"
+        "\"name\":\"%s\","
+        "\"unique_id\":\"%s_%s\","
+        "\"command_topic\":\"%s\","
+        "\"state_topic\":\"%s\","
+        "\"payload_on\":\"ON\","
+        "\"payload_off\":\"OFF\","
+        "\"state_on\":\"ON\","
+        "\"state_off\":\"OFF\","
+        "%s"
+        "\"entity_category\":\"%s\","
+        "\"availability_topic\":\"%s\","
+        "\"payload_available\":\"online\","
+        "\"payload_not_available\":\"offline\","
+        "%s"
+        "}",
+        name,
+        s_mqtt.device_id,
+        unique_suffix,
+        command_topic,
+        state_topic,
+        icon_json,
+        entity_category,
+        s_mqtt.availability_topic,
+        device_json);
+    if (icon_json != NULL && icon_json[0] != '\0') {
+        free((void *)icon_json);
+    }
+    if (payload != NULL) {
+        (void)otl_mqtt_publish_discovery_payload(discovery_topic, payload);
+        free(payload);
+    }
+}
+
+static void otl_mqtt_publish_text_sensor(const char *name,
+                                         const char *unique_suffix,
+                                         const char *state_topic,
+                                         const char *discovery_topic,
+                                         const char *icon,
+                                         const char *entity_category,
+                                         const char *device_json)
+{
+    char *payload = NULL;
+    const char *icon_json = "";
+
+    if (name == NULL || unique_suffix == NULL || state_topic == NULL || discovery_topic == NULL ||
+        entity_category == NULL || device_json == NULL) {
+        return;
+    }
+
+    if (icon != NULL && icon[0] != '\0') {
+        icon_json = otl_mqtt_alloc_printf("\"icon\":\"%s\",", icon);
+        if (icon_json == NULL) {
+            return;
+        }
+    }
+
+    payload = otl_mqtt_alloc_printf(
+        "{"
+        "\"name\":\"%s\","
+        "\"unique_id\":\"%s_%s\","
+        "\"state_topic\":\"%s\","
+        "%s"
+        "\"entity_category\":\"%s\","
+        "\"availability_topic\":\"%s\","
+        "\"payload_available\":\"online\","
+        "\"payload_not_available\":\"offline\","
+        "%s"
+        "}",
+        name,
+        s_mqtt.device_id,
+        unique_suffix,
+        state_topic,
+        icon_json,
+        entity_category,
+        s_mqtt.availability_topic,
+        device_json);
+    if (icon_json != NULL && icon_json[0] != '\0') {
+        free((void *)icon_json);
+    }
+    if (payload != NULL) {
+        (void)otl_mqtt_publish_discovery_payload(discovery_topic, payload);
+        free(payload);
+    }
+}
+
+static void otl_mqtt_publish_binary_sensor(const char *name,
+                                           const char *unique_suffix,
+                                           const char *state_topic,
+                                           const char *discovery_topic,
+                                           const char *icon,
+                                           const char *entity_category,
+                                           const char *device_json)
+{
+    char *payload = NULL;
+    const char *icon_json = "";
+
+    if (name == NULL || unique_suffix == NULL || state_topic == NULL || discovery_topic == NULL ||
+        entity_category == NULL || device_json == NULL) {
+        return;
+    }
+
+    if (icon != NULL && icon[0] != '\0') {
+        icon_json = otl_mqtt_alloc_printf("\"icon\":\"%s\",", icon);
+        if (icon_json == NULL) {
+            return;
+        }
+    }
+
+    payload = otl_mqtt_alloc_printf(
+        "{"
+        "\"name\":\"%s\","
+        "\"unique_id\":\"%s_%s\","
+        "\"state_topic\":\"%s\","
+        "\"payload_on\":\"ON\","
+        "\"payload_off\":\"OFF\","
+        "%s"
+        "\"entity_category\":\"%s\","
+        "\"availability_topic\":\"%s\","
+        "\"payload_available\":\"online\","
+        "\"payload_not_available\":\"offline\","
+        "%s"
+        "}",
+        name,
+        s_mqtt.device_id,
+        unique_suffix,
+        state_topic,
+        icon_json,
+        entity_category,
+        s_mqtt.availability_topic,
+        device_json);
+    if (icon_json != NULL && icon_json[0] != '\0') {
+        free((void *)icon_json);
+    }
+    if (payload != NULL) {
+        (void)otl_mqtt_publish_discovery_payload(discovery_topic, payload);
+        free(payload);
+    }
+}
+
 static int otl_mqtt_brightness_to_ha(float brightness_percent)
 {
     float ratio = otl_mqtt_clampf(brightness_percent, 0.0f, OTL_MQTT_MAX_BRIGHTNESS_PCT);
@@ -344,6 +572,16 @@ static float otl_mqtt_mired_to_temp_ratio(int mired)
     return (OTL_MQTT_WARM_MIRED - clamped) / (OTL_MQTT_WARM_MIRED - OTL_MQTT_COOL_MIRED);
 }
 
+static float otl_mqtt_cm_to_feet(float cm)
+{
+    return cm / OTL_MQTT_CM_PER_FOOT;
+}
+
+static int otl_mqtt_feet_to_cm(float feet)
+{
+    return (int)lroundf(feet * OTL_MQTT_CM_PER_FOOT);
+}
+
 static void otl_mqtt_publish(const char *topic, const char *payload, bool retain)
 {
     if (!s_mqtt.connected || s_mqtt.client == NULL || topic == NULL || payload == NULL) {
@@ -384,7 +622,7 @@ static char *otl_mqtt_alloc_device_json(void)
         "\"device\":{"
         "\"identifiers\":[\"%s\"],"
         "\"name\":\"%s\","
-        "\"manufacturer\":\"Open Task Light\","
+        "\"manufacturer\":\"Basement Labs\","
         "\"model\":\"Open Task Light\","
         "\"sw_version\":\"%s\""
         "}",
@@ -427,6 +665,19 @@ static void otl_mqtt_publish_telemetry(const otl_telemetry_t *telemetry)
     otl_mqtt_publish(s_mqtt.thermal_limited_state_topic,
                      telemetry->thermal_limited ? "ON" : "OFF",
                      true);
+#if CONFIG_OTL_PRESENCE_SENSOR
+    otl_mqtt_publish(s_mqtt.motion_state_topic,
+                     telemetry->radar_motion_detected ? "ON" : "OFF",
+                     true);
+    otl_mqtt_publish_float(s_mqtt.motion_distance_state_topic,
+                           otl_mqtt_cm_to_feet((float)telemetry->radar_motion_distance_cm),
+                           1,
+                           true);
+    otl_mqtt_publish_float(s_mqtt.stationary_distance_state_topic,
+                           otl_mqtt_cm_to_feet((float)telemetry->radar_stationary_distance_cm),
+                           1,
+                           true);
+#endif
     if (telemetry->wifi_connected) {
         otl_mqtt_publish_int(s_mqtt.wifi_rssi_state_topic, telemetry->wifi_rssi_dbm, true);
     }
@@ -453,9 +704,34 @@ static void otl_mqtt_publish_settings(const otl_runtime_settings_t *settings)
                            settings->led_thermal_limit_c,
                            0,
                            true);
-    otl_mqtt_publish(s_mqtt.verbose_diag_state_topic,
-                     settings->verbose_diagnostics_enabled ? "ON" : "OFF",
-                     true);
+    otl_mqtt_publish_bool_state(s_mqtt.verbose_diag_state_topic,
+                                settings->verbose_diagnostics_enabled);
+    otl_mqtt_publish_bool_state(s_mqtt.status_log_state_topic,
+                                settings->status_logging_enabled);
+    otl_mqtt_publish_bool_state(s_mqtt.sensor_debug_state_topic,
+                                settings->sensor_debug_logging_enabled);
+    otl_mqtt_publish_bool_state(s_mqtt.touch_event_log_state_topic,
+                                settings->touch_event_logging_enabled);
+    otl_mqtt_publish_bool_state(s_mqtt.touch_cal_log_state_topic,
+                                settings->touch_calibration_logging_enabled);
+    otl_mqtt_publish_bool_state(s_mqtt.touch_raw_log_state_topic,
+                                settings->touch_raw_logging_enabled);
+    otl_mqtt_publish_bool_state(s_mqtt.pwm_log_state_topic,
+                                settings->pwm_duty_logging_enabled);
+#if CONFIG_OTL_PRESENCE_SENSOR
+    otl_mqtt_publish_bool_state(s_mqtt.radar_log_state_topic,
+                                settings->radar_status_logging_enabled);
+    otl_mqtt_publish_float(s_mqtt.radar_motion_max_distance_state_topic,
+                           otl_mqtt_cm_to_feet((float)settings->radar_motion_max_distance_cm),
+                           1,
+                           true);
+    otl_mqtt_publish_float(s_mqtt.radar_stationary_max_distance_state_topic,
+                           otl_mqtt_cm_to_feet((float)settings->radar_stationary_max_distance_cm),
+                           1,
+                           true);
+    otl_mqtt_publish_bool_state(s_mqtt.occupancy_auto_off_state_topic,
+                                settings->occupancy_auto_off_enabled);
+#endif
 }
 
 static void otl_mqtt_publish_event(const otl_runtime_event_t *event)
@@ -506,6 +782,39 @@ cleanup:
     free(message_escaped);
     free(json_payload);
     free(last_event_payload);
+}
+
+static void otl_mqtt_publish_build_info(void)
+{
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    otl_mqtt_publish(s_mqtt.firmware_built_state_topic, OTL_BUILD_TIMESTAMP, true);
+
+    if (app_desc != NULL) {
+        otl_mqtt_publish(s_mqtt.firmware_version_state_topic, app_desc->version, true);
+        otl_mqtt_publish(s_mqtt.firmware_idf_state_topic, app_desc->idf_ver, true);
+    }
+    otl_mqtt_publish(s_mqtt.firmware_target_state_topic, CONFIG_IDF_TARGET, true);
+    otl_mqtt_publish_bool_state(s_mqtt.firmware_homekit_state_topic,
+#if CONFIG_OTL_HOMEKIT_ENABLE
+                                true
+#else
+                                false
+#endif
+    );
+    otl_mqtt_publish_bool_state(s_mqtt.firmware_presence_state_topic,
+#if CONFIG_OTL_PRESENCE_SENSOR
+                                true
+#else
+                                false
+#endif
+    );
+    otl_mqtt_publish_bool_state(s_mqtt.firmware_circadian_state_topic,
+#if CONFIG_OTL_CIRCADIAN_ENABLE
+                                true
+#else
+                                false
+#endif
+    );
 }
 
 static esp_err_t otl_mqtt_publish_discovery_payload(const char *topic, const char *payload)
@@ -565,7 +874,7 @@ static void otl_mqtt_publish_discovery(void)
 #if CONFIG_OTL_PRESENCE_SENSOR
     payload = otl_mqtt_alloc_printf(
         "{"
-        "\"name\":\"Occupancy\","
+        "\"name\":\"Presence\","
         "\"unique_id\":\"%s_occupancy\","
         "\"state_topic\":\"%s\","
         "\"device_class\":\"occupancy\","
@@ -582,6 +891,77 @@ static void otl_mqtt_publish_discovery(void)
         device_json);
     if (payload != NULL) {
         (void)otl_mqtt_publish_discovery_payload(s_mqtt.occupancy_discovery_topic, payload);
+        free(payload);
+        payload = NULL;
+    }
+
+    payload = otl_mqtt_alloc_printf(
+        "{"
+        "\"name\":\"Motion\","
+        "\"unique_id\":\"%s_motion\","
+        "\"state_topic\":\"%s\","
+        "\"device_class\":\"motion\","
+        "\"payload_on\":\"ON\","
+        "\"payload_off\":\"OFF\","
+        "\"availability_topic\":\"%s\","
+        "\"payload_available\":\"online\","
+        "\"payload_not_available\":\"offline\","
+        "%s"
+        "}",
+        s_mqtt.device_id,
+        s_mqtt.motion_state_topic,
+        s_mqtt.availability_topic,
+        device_json);
+    if (payload != NULL) {
+        (void)otl_mqtt_publish_discovery_payload(s_mqtt.motion_discovery_topic, payload);
+        free(payload);
+        payload = NULL;
+    }
+
+    payload = otl_mqtt_alloc_printf(
+        "{"
+        "\"name\":\"Radar Motion Distance\","
+        "\"unique_id\":\"%s_motion_distance\","
+        "\"state_topic\":\"%s\","
+        "\"unit_of_measurement\":\"ft\","
+        "\"state_class\":\"measurement\","
+        "\"entity_category\":\"diagnostic\","
+        "\"icon\":\"mdi:ruler\","
+        "\"availability_topic\":\"%s\","
+        "\"payload_available\":\"online\","
+        "\"payload_not_available\":\"offline\","
+        "%s"
+        "}",
+        s_mqtt.device_id,
+        s_mqtt.motion_distance_state_topic,
+        s_mqtt.availability_topic,
+        device_json);
+    if (payload != NULL) {
+        (void)otl_mqtt_publish_discovery_payload(s_mqtt.motion_distance_discovery_topic, payload);
+        free(payload);
+        payload = NULL;
+    }
+
+    payload = otl_mqtt_alloc_printf(
+        "{"
+        "\"name\":\"Radar Presence Distance\","
+        "\"unique_id\":\"%s_stationary_distance\","
+        "\"state_topic\":\"%s\","
+        "\"unit_of_measurement\":\"ft\","
+        "\"state_class\":\"measurement\","
+        "\"entity_category\":\"diagnostic\","
+        "\"icon\":\"mdi:ruler\","
+        "\"availability_topic\":\"%s\","
+        "\"payload_available\":\"online\","
+        "\"payload_not_available\":\"offline\","
+        "%s"
+        "}",
+        s_mqtt.device_id,
+        s_mqtt.stationary_distance_state_topic,
+        s_mqtt.availability_topic,
+        device_json);
+    if (payload != NULL) {
+        (void)otl_mqtt_publish_discovery_payload(s_mqtt.stationary_distance_discovery_topic, payload);
         free(payload);
         payload = NULL;
     }
@@ -612,10 +992,9 @@ static void otl_mqtt_publish_discovery(void)
 
     payload = otl_mqtt_alloc_printf(
         "{"
-        "\"name\":\"LED NTC Temperature\","
+        "\"name\":\"Temperature LED NTC\","
         "\"unique_id\":\"%s_ntc_temperature\","
         "\"state_topic\":\"%s\","
-        "\"device_class\":\"temperature\","
         "\"unit_of_measurement\":\"°C\","
         "\"state_class\":\"measurement\","
         "\"entity_category\":\"diagnostic\","
@@ -636,10 +1015,9 @@ static void otl_mqtt_publish_discovery(void)
 
     payload = otl_mqtt_alloc_printf(
         "{"
-        "\"name\":\"ESP32-S3 Internal Temperature\","
+        "\"name\":\"Temperature ESP32-S3 Internal\","
         "\"unique_id\":\"%s_chip_temperature\","
         "\"state_topic\":\"%s\","
-        "\"device_class\":\"temperature\","
         "\"unit_of_measurement\":\"°C\","
         "\"state_class\":\"measurement\","
         "\"entity_category\":\"diagnostic\","
@@ -660,7 +1038,7 @@ static void otl_mqtt_publish_discovery(void)
 
     payload = otl_mqtt_alloc_printf(
         "{"
-        "\"name\":\"Thermal Max Brightness\","
+        "\"name\":\"Max Brightness Limit\","
         "\"unique_id\":\"%s_thermal_cap\","
         "\"state_topic\":\"%s\","
         "\"unit_of_measurement\":\"%%\","
@@ -683,7 +1061,7 @@ static void otl_mqtt_publish_discovery(void)
 
     payload = otl_mqtt_alloc_printf(
         "{"
-        "\"name\":\"Thermal Limited\","
+        "\"name\":\"Thermal Throttle\","
         "\"unique_id\":\"%s_thermal_limited\","
         "\"state_topic\":\"%s\","
         "\"device_class\":\"problem\","
@@ -734,7 +1112,6 @@ static void otl_mqtt_publish_discovery(void)
         "\"unique_id\":\"%s_led_thermal_limit\","
         "\"command_topic\":\"%s\","
         "\"state_topic\":\"%s\","
-        "\"device_class\":\"temperature\","
         "\"unit_of_measurement\":\"°C\","
         "\"entity_category\":\"config\","
         "\"min\":60,"
@@ -757,10 +1134,74 @@ static void otl_mqtt_publish_discovery(void)
         payload = NULL;
     }
 
+#if CONFIG_OTL_PRESENCE_SENSOR
+    payload = otl_mqtt_alloc_printf(
+        "{"
+        "\"name\":\"Radar Motion Max Distance\","
+        "\"unique_id\":\"%s_motion_max_distance\","
+        "\"command_topic\":\"%s\","
+        "\"state_topic\":\"%s\","
+        "\"unit_of_measurement\":\"ft\","
+        "\"entity_category\":\"config\","
+        "\"min\":%.1f,"
+        "\"max\":%.1f,"
+        "\"step\":0.1,"
+        "\"mode\":\"box\","
+        "\"icon\":\"mdi:ruler\","
+        "\"availability_topic\":\"%s\","
+        "\"payload_available\":\"online\","
+        "\"payload_not_available\":\"offline\","
+        "%s"
+        "}",
+        s_mqtt.device_id,
+        s_mqtt.radar_motion_max_distance_command_topic,
+        s_mqtt.radar_motion_max_distance_state_topic,
+        otl_mqtt_cm_to_feet(50.0f),
+        otl_mqtt_cm_to_feet(600.0f),
+        s_mqtt.availability_topic,
+        device_json);
+    if (payload != NULL) {
+        (void)otl_mqtt_publish_discovery_payload(s_mqtt.radar_motion_max_distance_discovery_topic, payload);
+        free(payload);
+        payload = NULL;
+    }
+
+    payload = otl_mqtt_alloc_printf(
+        "{"
+        "\"name\":\"Radar Presence Max Distance\","
+        "\"unique_id\":\"%s_stationary_max_distance\","
+        "\"command_topic\":\"%s\","
+        "\"state_topic\":\"%s\","
+        "\"unit_of_measurement\":\"ft\","
+        "\"entity_category\":\"config\","
+        "\"min\":%.1f,"
+        "\"max\":%.1f,"
+        "\"step\":0.1,"
+        "\"mode\":\"box\","
+        "\"icon\":\"mdi:ruler\","
+        "\"availability_topic\":\"%s\","
+        "\"payload_available\":\"online\","
+        "\"payload_not_available\":\"offline\","
+        "%s"
+        "}",
+        s_mqtt.device_id,
+        s_mqtt.radar_stationary_max_distance_command_topic,
+        s_mqtt.radar_stationary_max_distance_state_topic,
+        otl_mqtt_cm_to_feet(50.0f),
+        otl_mqtt_cm_to_feet(600.0f),
+        s_mqtt.availability_topic,
+        device_json);
+    if (payload != NULL) {
+        (void)otl_mqtt_publish_discovery_payload(s_mqtt.radar_stationary_max_distance_discovery_topic, payload);
+        free(payload);
+        payload = NULL;
+    }
+#endif
+
 #if CONFIG_OTL_CIRCADIAN_ENABLE
     payload = otl_mqtt_alloc_printf(
         "{"
-        "\"name\":\"Firmware Circadian\","
+        "\"name\":\"Circadian Lighting\","
         "\"unique_id\":\"%s_circadian_enabled\","
         "\"command_topic\":\"%s\","
         "\"state_topic\":\"%s\","
@@ -787,7 +1228,7 @@ static void otl_mqtt_publish_discovery(void)
 
     payload = otl_mqtt_alloc_printf(
         "{"
-        "\"name\":\"Firmware Circadian Coolest Time\","
+        "\"name\":\"Circadian Lighting Coolest Time\","
         "\"unique_id\":\"%s_circadian_coolest\","
         "\"command_topic\":\"%s\","
         "\"state_topic\":\"%s\","
@@ -815,7 +1256,7 @@ static void otl_mqtt_publish_discovery(void)
 
     payload = otl_mqtt_alloc_printf(
         "{"
-        "\"name\":\"Firmware Circadian Warmest Time\","
+        "\"name\":\"Circadian Lighting Warmest Time\","
         "\"unique_id\":\"%s_circadian_warmest\","
         "\"command_topic\":\"%s\","
         "\"state_topic\":\"%s\","
@@ -852,7 +1293,7 @@ static void otl_mqtt_publish_discovery(void)
         "\"payload_off\":\"OFF\","
         "\"state_on\":\"ON\","
         "\"state_off\":\"OFF\","
-        "\"entity_category\":\"config\","
+        "\"entity_category\":\"diagnostic\","
         "\"availability_topic\":\"%s\","
         "\"payload_available\":\"online\","
         "\"payload_not_available\":\"offline\","
@@ -868,6 +1309,123 @@ static void otl_mqtt_publish_discovery(void)
         free(payload);
         payload = NULL;
     }
+
+    otl_mqtt_publish_switch("Serial Status Logs",
+                            "status_logs",
+                            s_mqtt.status_log_command_topic,
+                            s_mqtt.status_log_state_topic,
+                            s_mqtt.status_log_discovery_topic,
+                            "mdi:text-box-outline",
+                            "diagnostic",
+                            device_json);
+    otl_mqtt_publish_switch("Serial Sensor Debug Logs",
+                            "sensor_debug_logs",
+                            s_mqtt.sensor_debug_command_topic,
+                            s_mqtt.sensor_debug_state_topic,
+                            s_mqtt.sensor_debug_discovery_topic,
+                            "mdi:tune-variant",
+                            "diagnostic",
+                            device_json);
+    otl_mqtt_publish_switch("Serial Touch Event Logs",
+                            "touch_event_logs",
+                            s_mqtt.touch_event_log_command_topic,
+                            s_mqtt.touch_event_log_state_topic,
+                            s_mqtt.touch_event_log_discovery_topic,
+                            "mdi:gesture-tap",
+                            "diagnostic",
+                            device_json);
+    otl_mqtt_publish_switch("Serial Touch Calibration Logs",
+                            "touch_calibration_logs",
+                            s_mqtt.touch_cal_log_command_topic,
+                            s_mqtt.touch_cal_log_state_topic,
+                            s_mqtt.touch_cal_log_discovery_topic,
+                            "mdi:tune",
+                            "diagnostic",
+                            device_json);
+    otl_mqtt_publish_switch("Serial Touch Raw Logs",
+                            "touch_raw_logs",
+                            s_mqtt.touch_raw_log_command_topic,
+                            s_mqtt.touch_raw_log_state_topic,
+                            s_mqtt.touch_raw_log_discovery_topic,
+                            "mdi:waveform",
+                            "diagnostic",
+                            device_json);
+    otl_mqtt_publish_switch("Serial PWM Duty Logs",
+                            "pwm_duty_logs",
+                            s_mqtt.pwm_log_command_topic,
+                            s_mqtt.pwm_log_state_topic,
+                            s_mqtt.pwm_log_discovery_topic,
+                            "mdi:sine-wave",
+                            "diagnostic",
+                            device_json);
+#if CONFIG_OTL_PRESENCE_SENSOR
+    otl_mqtt_publish_switch("Serial Radar Status Logs",
+                            "radar_status_logs",
+                            s_mqtt.radar_log_command_topic,
+                            s_mqtt.radar_log_state_topic,
+                            s_mqtt.radar_log_discovery_topic,
+                            "mdi:radar",
+                            "diagnostic",
+                            device_json);
+    otl_mqtt_publish_switch("Radar Occupancy Light Auto-Off",
+                            "occupancy_auto_off",
+                            s_mqtt.occupancy_auto_off_command_topic,
+                            s_mqtt.occupancy_auto_off_state_topic,
+                            s_mqtt.occupancy_auto_off_discovery_topic,
+                            "mdi:motion-sensor-off",
+                            "config",
+                            device_json);
+#endif
+
+    otl_mqtt_publish_text_sensor("Firmware Version",
+                                 "firmware_version",
+                                 s_mqtt.firmware_version_state_topic,
+                                 s_mqtt.firmware_version_discovery_topic,
+                                 "mdi:tag-text-outline",
+                                 "diagnostic",
+                                 device_json);
+    otl_mqtt_publish_text_sensor("Firmware Built",
+                                 "firmware_built",
+                                 s_mqtt.firmware_built_state_topic,
+                                 s_mqtt.firmware_built_discovery_topic,
+                                 "mdi:calendar-clock",
+                                 "diagnostic",
+                                 device_json);
+    otl_mqtt_publish_text_sensor("Firmware ESP-IDF",
+                                 "firmware_idf",
+                                 s_mqtt.firmware_idf_state_topic,
+                                 s_mqtt.firmware_idf_discovery_topic,
+                                 "mdi:chip",
+                                 "diagnostic",
+                                 device_json);
+    otl_mqtt_publish_text_sensor("Firmware Target",
+                                 "firmware_target",
+                                 s_mqtt.firmware_target_state_topic,
+                                 s_mqtt.firmware_target_discovery_topic,
+                                 "mdi:memory",
+                                 "diagnostic",
+                                 device_json);
+    otl_mqtt_publish_binary_sensor("Firmware HomeKit Support",
+                                   "firmware_homekit",
+                                   s_mqtt.firmware_homekit_state_topic,
+                                   s_mqtt.firmware_homekit_discovery_topic,
+                                   "mdi:home-automation",
+                                   "diagnostic",
+                                   device_json);
+    otl_mqtt_publish_binary_sensor("Firmware Presence Sensor Support",
+                                   "firmware_presence_sensor",
+                                   s_mqtt.firmware_presence_state_topic,
+                                   s_mqtt.firmware_presence_discovery_topic,
+                                   "mdi:radar",
+                                   "diagnostic",
+                                   device_json);
+    otl_mqtt_publish_binary_sensor("Firmware Circadian Lighting Support",
+                                   "firmware_circadian",
+                                   s_mqtt.firmware_circadian_state_topic,
+                                   s_mqtt.firmware_circadian_discovery_topic,
+                                   "mdi:theme-light-dark",
+                                   "diagnostic",
+                                   device_json);
 
     payload = otl_mqtt_alloc_printf(
         "{"
@@ -897,6 +1455,31 @@ static void otl_mqtt_publish_discovery(void)
 static void otl_mqtt_republish_settings_after_invalid_write(void)
 {
     otl_runtime_settings_notify_current(OTL_CHANGE_SOURCE_SYSTEM);
+}
+
+static bool otl_mqtt_handle_bool_setting_command(esp_mqtt_event_handle_t event,
+                                                 const char *topic,
+                                                 otl_mqtt_bool_setting_setter_fn setter,
+                                                 const char *rejected_message,
+                                                 const char *failed_message)
+{
+    bool enabled = false;
+
+    if (!otl_mqtt_topic_matches(event, topic)) {
+        return false;
+    }
+
+    if (!otl_mqtt_parse_on_off_payload(event, &enabled)) {
+        otl_event_emit(OTL_EVENT_LEVEL_WARNING, "mqtt", rejected_message);
+        otl_mqtt_republish_settings_after_invalid_write();
+        return true;
+    }
+
+    if (setter(enabled, OTL_CHANGE_SOURCE_MQTT) != ESP_OK) {
+        otl_event_emit(OTL_EVENT_LEVEL_WARNING, "mqtt", failed_message);
+        otl_mqtt_republish_settings_after_invalid_write();
+    }
+    return true;
 }
 
 static void otl_mqtt_handle_command(esp_mqtt_event_handle_t event)
@@ -950,6 +1533,72 @@ static void otl_mqtt_handle_command(esp_mqtt_event_handle_t event)
         }, OTL_CHANGE_SOURCE_MQTT);
         return;
     }
+
+    if (otl_mqtt_handle_bool_setting_command(event,
+                                             s_mqtt.status_log_command_topic,
+                                             otl_runtime_set_status_logging_enabled,
+                                             "Rejected status log write",
+                                             "Failed to update status logs")) {
+        return;
+    }
+
+    if (otl_mqtt_handle_bool_setting_command(event,
+                                             s_mqtt.sensor_debug_command_topic,
+                                             otl_runtime_set_sensor_debug_logging_enabled,
+                                             "Rejected sensor debug log write",
+                                             "Failed to update sensor debug logs")) {
+        return;
+    }
+
+    if (otl_mqtt_handle_bool_setting_command(event,
+                                             s_mqtt.touch_event_log_command_topic,
+                                             otl_runtime_set_touch_event_logging_enabled,
+                                             "Rejected touch event log write",
+                                             "Failed to update touch event logs")) {
+        return;
+    }
+
+    if (otl_mqtt_handle_bool_setting_command(event,
+                                             s_mqtt.touch_cal_log_command_topic,
+                                             otl_runtime_set_touch_calibration_logging_enabled,
+                                             "Rejected touch calibration log write",
+                                             "Failed to update touch calibration logs")) {
+        return;
+    }
+
+    if (otl_mqtt_handle_bool_setting_command(event,
+                                             s_mqtt.touch_raw_log_command_topic,
+                                             otl_runtime_set_touch_raw_logging_enabled,
+                                             "Rejected touch raw log write",
+                                             "Failed to update touch raw logs")) {
+        return;
+    }
+
+    if (otl_mqtt_handle_bool_setting_command(event,
+                                             s_mqtt.pwm_log_command_topic,
+                                             otl_runtime_set_pwm_duty_logging_enabled,
+                                             "Rejected PWM log write",
+                                             "Failed to update PWM logs")) {
+        return;
+    }
+
+#if CONFIG_OTL_PRESENCE_SENSOR
+    if (otl_mqtt_handle_bool_setting_command(event,
+                                             s_mqtt.radar_log_command_topic,
+                                             otl_runtime_set_radar_status_logging_enabled,
+                                             "Rejected radar log write",
+                                             "Failed to update radar logs")) {
+        return;
+    }
+
+    if (otl_mqtt_handle_bool_setting_command(event,
+                                             s_mqtt.occupancy_auto_off_command_topic,
+                                             otl_runtime_set_occupancy_auto_off_enabled,
+                                             "Rejected occupancy auto-off write",
+                                             "Failed to update occupancy auto-off")) {
+        return;
+    }
+#endif
 
 #if CONFIG_OTL_CIRCADIAN_ENABLE
     if (otl_mqtt_topic_matches(event, s_mqtt.circadian_enabled_command_topic)) {
@@ -1010,6 +1659,36 @@ static void otl_mqtt_handle_command(esp_mqtt_event_handle_t event)
         }
         return;
     }
+
+#if CONFIG_OTL_PRESENCE_SENSOR
+    if (otl_mqtt_topic_matches(event, s_mqtt.radar_motion_max_distance_command_topic)) {
+        float limit_ft = 0.0f;
+        if (!otl_mqtt_parse_float_payload(event, &limit_ft)) {
+            otl_event_emit(OTL_EVENT_LEVEL_WARNING, "mqtt", "Rejected motion max distance write");
+            otl_mqtt_republish_settings_after_invalid_write();
+            return;
+        }
+        if (otl_runtime_set_radar_motion_max_distance_cm(otl_mqtt_feet_to_cm(limit_ft), OTL_CHANGE_SOURCE_MQTT) != ESP_OK) {
+            otl_event_emit(OTL_EVENT_LEVEL_WARNING, "mqtt", "Rejected motion max distance write");
+            otl_mqtt_republish_settings_after_invalid_write();
+        }
+        return;
+    }
+
+    if (otl_mqtt_topic_matches(event, s_mqtt.radar_stationary_max_distance_command_topic)) {
+        float limit_ft = 0.0f;
+        if (!otl_mqtt_parse_float_payload(event, &limit_ft)) {
+            otl_event_emit(OTL_EVENT_LEVEL_WARNING, "mqtt", "Rejected stationary max distance write");
+            otl_mqtt_republish_settings_after_invalid_write();
+            return;
+        }
+        if (otl_runtime_set_radar_stationary_max_distance_cm(otl_mqtt_feet_to_cm(limit_ft), OTL_CHANGE_SOURCE_MQTT) != ESP_OK) {
+            otl_event_emit(OTL_EVENT_LEVEL_WARNING, "mqtt", "Rejected stationary max distance write");
+            otl_mqtt_republish_settings_after_invalid_write();
+        }
+        return;
+    }
+#endif
 
     if (otl_mqtt_topic_matches(event, s_mqtt.verbose_diag_command_topic)) {
         bool enabled = false;
@@ -1142,6 +1821,45 @@ static esp_err_t otl_mqtt_build_topics(void)
                                               s_mqtt.device_id),
                         TAG,
                         "MQTT occupancy discovery topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.motion_state_topic,
+                                              sizeof(s_mqtt.motion_state_topic),
+                                              "%s/motion/state",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT motion state topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.motion_discovery_topic,
+                                              sizeof(s_mqtt.motion_discovery_topic),
+                                              "%s/binary_sensor/%s_motion/config",
+                                              CONFIG_OTL_MQTT_DISCOVERY_PREFIX,
+                                              s_mqtt.device_id),
+                        TAG,
+                        "MQTT motion discovery topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.motion_distance_state_topic,
+                                              sizeof(s_mqtt.motion_distance_state_topic),
+                                              "%s/radar/motion_distance/state",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT motion distance state topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.motion_distance_discovery_topic,
+                                              sizeof(s_mqtt.motion_distance_discovery_topic),
+                                              "%s/sensor/%s_motion_distance/config",
+                                              CONFIG_OTL_MQTT_DISCOVERY_PREFIX,
+                                              s_mqtt.device_id),
+                        TAG,
+                        "MQTT motion distance discovery topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.stationary_distance_state_topic,
+                                              sizeof(s_mqtt.stationary_distance_state_topic),
+                                              "%s/radar/stationary_distance/state",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT stationary distance state topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.stationary_distance_discovery_topic,
+                                              sizeof(s_mqtt.stationary_distance_discovery_topic),
+                                              "%s/sensor/%s_stationary_distance/config",
+                                              CONFIG_OTL_MQTT_DISCOVERY_PREFIX,
+                                              s_mqtt.device_id),
+                        TAG,
+                        "MQTT stationary distance discovery topic too long");
 #endif
     ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.ambient_lux_state_topic,
                                               sizeof(s_mqtt.ambient_lux_state_topic),
@@ -1240,6 +1958,46 @@ static esp_err_t otl_mqtt_build_topics(void)
                                               s_mqtt.device_id),
                         TAG,
                         "MQTT LED thermal limit discovery topic too long");
+#if CONFIG_OTL_PRESENCE_SENSOR
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.radar_motion_max_distance_state_topic,
+                                              sizeof(s_mqtt.radar_motion_max_distance_state_topic),
+                                              "%s/radar/motion_max_distance/state",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT motion max distance state topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.radar_motion_max_distance_command_topic,
+                                              sizeof(s_mqtt.radar_motion_max_distance_command_topic),
+                                              "%s/radar/motion_max_distance/set",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT motion max distance command topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.radar_motion_max_distance_discovery_topic,
+                                              sizeof(s_mqtt.radar_motion_max_distance_discovery_topic),
+                                              "%s/number/%s_motion_max_distance/config",
+                                              CONFIG_OTL_MQTT_DISCOVERY_PREFIX,
+                                              s_mqtt.device_id),
+                        TAG,
+                        "MQTT motion max distance discovery topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.radar_stationary_max_distance_state_topic,
+                                              sizeof(s_mqtt.radar_stationary_max_distance_state_topic),
+                                              "%s/radar/stationary_max_distance/state",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT stationary max distance state topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.radar_stationary_max_distance_command_topic,
+                                              sizeof(s_mqtt.radar_stationary_max_distance_command_topic),
+                                              "%s/radar/stationary_max_distance/set",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT stationary max distance command topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.radar_stationary_max_distance_discovery_topic,
+                                              sizeof(s_mqtt.radar_stationary_max_distance_discovery_topic),
+                                              "%s/number/%s_stationary_max_distance/config",
+                                              CONFIG_OTL_MQTT_DISCOVERY_PREFIX,
+                                              s_mqtt.device_id),
+                        TAG,
+                        "MQTT stationary max distance discovery topic too long");
+#endif
 #if CONFIG_OTL_CIRCADIAN_ENABLE
     ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.circadian_enabled_state_topic,
                                               sizeof(s_mqtt.circadian_enabled_state_topic),
@@ -1318,6 +2076,251 @@ static esp_err_t otl_mqtt_build_topics(void)
                                               s_mqtt.device_id),
                         TAG,
                         "MQTT verbose diagnostics discovery topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.status_log_state_topic,
+                                              sizeof(s_mqtt.status_log_state_topic),
+                                              "%s/logging/status/state",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT status log state topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.status_log_command_topic,
+                                              sizeof(s_mqtt.status_log_command_topic),
+                                              "%s/logging/status/set",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT status log command topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.status_log_discovery_topic,
+                                              sizeof(s_mqtt.status_log_discovery_topic),
+                                              "%s/switch/%s_status_logs/config",
+                                              CONFIG_OTL_MQTT_DISCOVERY_PREFIX,
+                                              s_mqtt.device_id),
+                        TAG,
+                        "MQTT status log discovery topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.sensor_debug_state_topic,
+                                              sizeof(s_mqtt.sensor_debug_state_topic),
+                                              "%s/logging/sensor_debug/state",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT sensor debug state topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.sensor_debug_command_topic,
+                                              sizeof(s_mqtt.sensor_debug_command_topic),
+                                              "%s/logging/sensor_debug/set",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT sensor debug command topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.sensor_debug_discovery_topic,
+                                              sizeof(s_mqtt.sensor_debug_discovery_topic),
+                                              "%s/switch/%s_sensor_debug_logs/config",
+                                              CONFIG_OTL_MQTT_DISCOVERY_PREFIX,
+                                              s_mqtt.device_id),
+                        TAG,
+                        "MQTT sensor debug discovery topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.touch_event_log_state_topic,
+                                              sizeof(s_mqtt.touch_event_log_state_topic),
+                                              "%s/logging/touch_events/state",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT touch event log state topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.touch_event_log_command_topic,
+                                              sizeof(s_mqtt.touch_event_log_command_topic),
+                                              "%s/logging/touch_events/set",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT touch event log command topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.touch_event_log_discovery_topic,
+                                              sizeof(s_mqtt.touch_event_log_discovery_topic),
+                                              "%s/switch/%s_touch_event_logs/config",
+                                              CONFIG_OTL_MQTT_DISCOVERY_PREFIX,
+                                              s_mqtt.device_id),
+                        TAG,
+                        "MQTT touch event log discovery topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.touch_cal_log_state_topic,
+                                              sizeof(s_mqtt.touch_cal_log_state_topic),
+                                              "%s/logging/touch_calibration/state",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT touch calibration log state topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.touch_cal_log_command_topic,
+                                              sizeof(s_mqtt.touch_cal_log_command_topic),
+                                              "%s/logging/touch_calibration/set",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT touch calibration log command topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.touch_cal_log_discovery_topic,
+                                              sizeof(s_mqtt.touch_cal_log_discovery_topic),
+                                              "%s/switch/%s_touch_calibration_logs/config",
+                                              CONFIG_OTL_MQTT_DISCOVERY_PREFIX,
+                                              s_mqtt.device_id),
+                        TAG,
+                        "MQTT touch calibration log discovery topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.touch_raw_log_state_topic,
+                                              sizeof(s_mqtt.touch_raw_log_state_topic),
+                                              "%s/logging/touch_raw/state",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT touch raw log state topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.touch_raw_log_command_topic,
+                                              sizeof(s_mqtt.touch_raw_log_command_topic),
+                                              "%s/logging/touch_raw/set",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT touch raw log command topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.touch_raw_log_discovery_topic,
+                                              sizeof(s_mqtt.touch_raw_log_discovery_topic),
+                                              "%s/switch/%s_touch_raw_logs/config",
+                                              CONFIG_OTL_MQTT_DISCOVERY_PREFIX,
+                                              s_mqtt.device_id),
+                        TAG,
+                        "MQTT touch raw log discovery topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.pwm_log_state_topic,
+                                              sizeof(s_mqtt.pwm_log_state_topic),
+                                              "%s/logging/pwm_duty/state",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT PWM log state topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.pwm_log_command_topic,
+                                              sizeof(s_mqtt.pwm_log_command_topic),
+                                              "%s/logging/pwm_duty/set",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT PWM log command topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.pwm_log_discovery_topic,
+                                              sizeof(s_mqtt.pwm_log_discovery_topic),
+                                              "%s/switch/%s_pwm_duty_logs/config",
+                                              CONFIG_OTL_MQTT_DISCOVERY_PREFIX,
+                                              s_mqtt.device_id),
+                        TAG,
+                        "MQTT PWM log discovery topic too long");
+#if CONFIG_OTL_PRESENCE_SENSOR
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.radar_log_state_topic,
+                                              sizeof(s_mqtt.radar_log_state_topic),
+                                              "%s/logging/radar_status/state",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT radar log state topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.radar_log_command_topic,
+                                              sizeof(s_mqtt.radar_log_command_topic),
+                                              "%s/logging/radar_status/set",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT radar log command topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.radar_log_discovery_topic,
+                                              sizeof(s_mqtt.radar_log_discovery_topic),
+                                              "%s/switch/%s_radar_status_logs/config",
+                                              CONFIG_OTL_MQTT_DISCOVERY_PREFIX,
+                                              s_mqtt.device_id),
+                        TAG,
+                        "MQTT radar log discovery topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.occupancy_auto_off_state_topic,
+                                              sizeof(s_mqtt.occupancy_auto_off_state_topic),
+                                              "%s/occupancy/auto_off/state",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT occupancy auto-off state topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.occupancy_auto_off_command_topic,
+                                              sizeof(s_mqtt.occupancy_auto_off_command_topic),
+                                              "%s/occupancy/auto_off/set",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT occupancy auto-off command topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.occupancy_auto_off_discovery_topic,
+                                              sizeof(s_mqtt.occupancy_auto_off_discovery_topic),
+                                              "%s/switch/%s_occupancy_auto_off/config",
+                                              CONFIG_OTL_MQTT_DISCOVERY_PREFIX,
+                                              s_mqtt.device_id),
+                        TAG,
+                        "MQTT occupancy auto-off discovery topic too long");
+#endif
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.firmware_version_state_topic,
+                                              sizeof(s_mqtt.firmware_version_state_topic),
+                                              "%s/firmware/version/state",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT firmware version state topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.firmware_version_discovery_topic,
+                                              sizeof(s_mqtt.firmware_version_discovery_topic),
+                                              "%s/sensor/%s_firmware_version/config",
+                                              CONFIG_OTL_MQTT_DISCOVERY_PREFIX,
+                                              s_mqtt.device_id),
+                        TAG,
+                        "MQTT firmware version discovery topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.firmware_built_state_topic,
+                                              sizeof(s_mqtt.firmware_built_state_topic),
+                                              "%s/firmware/built/state",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT firmware built state topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.firmware_built_discovery_topic,
+                                              sizeof(s_mqtt.firmware_built_discovery_topic),
+                                              "%s/sensor/%s_firmware_built/config",
+                                              CONFIG_OTL_MQTT_DISCOVERY_PREFIX,
+                                              s_mqtt.device_id),
+                        TAG,
+                        "MQTT firmware built discovery topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.firmware_idf_state_topic,
+                                              sizeof(s_mqtt.firmware_idf_state_topic),
+                                              "%s/firmware/idf/state",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT firmware ESP-IDF state topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.firmware_idf_discovery_topic,
+                                              sizeof(s_mqtt.firmware_idf_discovery_topic),
+                                              "%s/sensor/%s_firmware_idf/config",
+                                              CONFIG_OTL_MQTT_DISCOVERY_PREFIX,
+                                              s_mqtt.device_id),
+                        TAG,
+                        "MQTT firmware ESP-IDF discovery topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.firmware_target_state_topic,
+                                              sizeof(s_mqtt.firmware_target_state_topic),
+                                              "%s/firmware/target/state",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT firmware target state topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.firmware_target_discovery_topic,
+                                              sizeof(s_mqtt.firmware_target_discovery_topic),
+                                              "%s/sensor/%s_firmware_target/config",
+                                              CONFIG_OTL_MQTT_DISCOVERY_PREFIX,
+                                              s_mqtt.device_id),
+                        TAG,
+                        "MQTT firmware target discovery topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.firmware_homekit_state_topic,
+                                              sizeof(s_mqtt.firmware_homekit_state_topic),
+                                              "%s/firmware/homekit/state",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT firmware HomeKit state topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.firmware_homekit_discovery_topic,
+                                              sizeof(s_mqtt.firmware_homekit_discovery_topic),
+                                              "%s/binary_sensor/%s_firmware_homekit/config",
+                                              CONFIG_OTL_MQTT_DISCOVERY_PREFIX,
+                                              s_mqtt.device_id),
+                        TAG,
+                        "MQTT firmware HomeKit discovery topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.firmware_presence_state_topic,
+                                              sizeof(s_mqtt.firmware_presence_state_topic),
+                                              "%s/firmware/presence_sensor/state",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT firmware presence sensor state topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.firmware_presence_discovery_topic,
+                                              sizeof(s_mqtt.firmware_presence_discovery_topic),
+                                              "%s/binary_sensor/%s_firmware_presence_sensor/config",
+                                              CONFIG_OTL_MQTT_DISCOVERY_PREFIX,
+                                              s_mqtt.device_id),
+                        TAG,
+                        "MQTT firmware presence sensor discovery topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.firmware_circadian_state_topic,
+                                              sizeof(s_mqtt.firmware_circadian_state_topic),
+                                              "%s/firmware/circadian/state",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT firmware circadian state topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.firmware_circadian_discovery_topic,
+                                              sizeof(s_mqtt.firmware_circadian_discovery_topic),
+                                              "%s/binary_sensor/%s_firmware_circadian/config",
+                                              CONFIG_OTL_MQTT_DISCOVERY_PREFIX,
+                                              s_mqtt.device_id),
+                        TAG,
+                        "MQTT firmware circadian discovery topic too long");
     ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.last_event_state_topic,
                                               sizeof(s_mqtt.last_event_state_topic),
                                               "%s/events/last/state",
@@ -1359,8 +2362,21 @@ static void otl_mqtt_event_handler(void *handler_args,
 #endif
             esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.led_thermal_limit_command_topic, 1);
             esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.verbose_diag_command_topic, 1);
+            esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.status_log_command_topic, 1);
+            esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.sensor_debug_command_topic, 1);
+            esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.touch_event_log_command_topic, 1);
+            esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.touch_cal_log_command_topic, 1);
+            esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.touch_raw_log_command_topic, 1);
+            esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.pwm_log_command_topic, 1);
+#if CONFIG_OTL_PRESENCE_SENSOR
+            esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.radar_log_command_topic, 1);
+            esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.radar_motion_max_distance_command_topic, 1);
+            esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.radar_stationary_max_distance_command_topic, 1);
+            esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.occupancy_auto_off_command_topic, 1);
+#endif
             otl_mqtt_publish_discovery();
             otl_mqtt_publish(s_mqtt.availability_topic, "online", true);
+            otl_mqtt_publish_build_info();
             otl_state_notify_current(OTL_CHANGE_SOURCE_SYSTEM);
             otl_telemetry_notify_current();
             otl_runtime_settings_notify_current(OTL_CHANGE_SOURCE_SYSTEM);

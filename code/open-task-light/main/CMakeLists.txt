@@ -2,8 +2,13 @@ set(otl_main_srcs
     "otl_main.c"
 )
 
+set(OTL_BUILD_INFO_HEADER
+    "${CMAKE_CURRENT_BINARY_DIR}/otl_build_info.h"
+)
+
 set(otl_main_include_dirs
     "."
+    "${CMAKE_CURRENT_BINARY_DIR}"
 )
 
 set(otl_main_requires
@@ -40,9 +45,31 @@ if(CONFIG_OTL_HOMEKIT_ENABLE)
     )
 endif()
 
+if(NOT CMAKE_BUILD_EARLY_EXPANSION)
+    add_custom_target(otl_refresh_build_info ALL
+        COMMAND ${CMAKE_COMMAND}
+                -DOUTPUT_FILE=${OTL_BUILD_INFO_HEADER}
+                -P "${CMAKE_CURRENT_LIST_DIR}/generate_build_info.cmake"
+        COMMENT "Generating Open Task Light build info"
+        VERBATIM
+        BYPRODUCTS "${OTL_BUILD_INFO_HEADER}"
+    )
+endif()
+
 idf_component_register(
     SRCS ${otl_main_srcs}
     INCLUDE_DIRS ${otl_main_include_dirs}
     REQUIRES ${otl_main_requires}
     PRIV_REQUIRES ${otl_main_priv_requires}
 )
+
+if(NOT CMAKE_BUILD_EARLY_EXPANSION)
+    add_dependencies(${COMPONENT_LIB} otl_refresh_build_info)
+endif()
+
+if(CONFIG_OTL_HOMEKIT_ENABLE)
+    target_link_libraries(${COMPONENT_LIB} PRIVATE
+        idf::esp_hap_core
+        idf::esp_hap_apple_profiles
+    )
+endif()

@@ -48,6 +48,9 @@ typedef struct {
     bool thermal_limited;
     bool thermal_ntc_hot;
     bool thermal_chip_hot;
+    bool radar_motion_detected;
+    int radar_motion_distance_cm;
+    int radar_stationary_distance_cm;
     bool wifi_connected;
     int wifi_rssi_dbm;
 } otl_telemetry_t;
@@ -58,6 +61,16 @@ typedef struct {
     char circadian_warmest_time[OTL_RUNTIME_TIME_STR_LEN];
     float led_thermal_limit_c;
     bool verbose_diagnostics_enabled;
+    bool status_logging_enabled;
+    bool sensor_debug_logging_enabled;
+    bool touch_event_logging_enabled;
+    bool touch_calibration_logging_enabled;
+    bool touch_raw_logging_enabled;
+    bool pwm_duty_logging_enabled;
+    bool radar_status_logging_enabled;
+    bool occupancy_auto_off_enabled;
+    int radar_motion_max_distance_cm;
+    int radar_stationary_max_distance_cm;
 } otl_runtime_settings_t;
 
 typedef enum {
@@ -97,6 +110,16 @@ bool otl_runtime_verbose_diagnostics_enabled(void);
 bool otl_runtime_circadian_is_enabled(void);
 bool otl_runtime_get_circadian_schedule(int *coolest_seconds, int *warmest_seconds);
 esp_err_t otl_runtime_set_verbose_diagnostics(bool enabled, otl_change_source_t source);
+esp_err_t otl_runtime_set_status_logging_enabled(bool enabled, otl_change_source_t source);
+esp_err_t otl_runtime_set_sensor_debug_logging_enabled(bool enabled, otl_change_source_t source);
+esp_err_t otl_runtime_set_touch_event_logging_enabled(bool enabled, otl_change_source_t source);
+esp_err_t otl_runtime_set_touch_calibration_logging_enabled(bool enabled, otl_change_source_t source);
+esp_err_t otl_runtime_set_touch_raw_logging_enabled(bool enabled, otl_change_source_t source);
+esp_err_t otl_runtime_set_pwm_duty_logging_enabled(bool enabled, otl_change_source_t source);
+esp_err_t otl_runtime_set_radar_status_logging_enabled(bool enabled, otl_change_source_t source);
+esp_err_t otl_runtime_set_occupancy_auto_off_enabled(bool enabled, otl_change_source_t source);
+esp_err_t otl_runtime_set_radar_motion_max_distance_cm(int limit_cm, otl_change_source_t source);
+esp_err_t otl_runtime_set_radar_stationary_max_distance_cm(int limit_cm, otl_change_source_t source);
 esp_err_t otl_runtime_set_circadian_enabled(bool enabled, otl_change_source_t source);
 esp_err_t otl_runtime_set_circadian_coolest_time(const char *hhmm, otl_change_source_t source);
 esp_err_t otl_runtime_set_circadian_warmest_time(const char *hhmm, otl_change_source_t source);

@@ -155,15 +155,15 @@ The firmware publishes a native Home Assistant MQTT device with:
   - last event
 - runtime controls
   - LED thermal limit
-  - firmware circadian enable
-  - firmware circadian coolest time
-  - firmware circadian warmest time
+  - circadian lighting enable
+  - circadian lighting coolest time
+  - circadian lighting warmest time
   - verbose diagnostics
 
 Important behavior:
 - the light state stays synchronized across touch, MQTT, presence behavior, and
   HomeKit when multiple integrations are enabled
-- firmware circadian is runtime-toggleable from Home Assistant so it does not
+- circadian lighting is runtime-toggleable from Home Assistant so it does not
   have to fight Adaptive Lighting or your own automations
 - the MQTT integration also publishes a structured event stream and a `Last Event`
   text sensor instead of mirroring raw serial logs
@@ -219,9 +219,9 @@ Compile-time circadian settings:
 Runtime behavior:
 - the circadian engine computes a base warm/cool mix across the day
 - temperature touch controls act as a user offset on top of that base
-- if MQTT is enabled, Home Assistant can turn firmware circadian on or off at runtime
-- if you want Home Assistant to own color temperature policy, disable firmware
-  circadian and use your own automations or Adaptive Lighting
+- if MQTT is enabled, Home Assistant can turn circadian lighting on or off at runtime
+- if you want Home Assistant to own color temperature policy, disable circadian
+  lighting and use your own automations or Adaptive Lighting
 
 ## Local Configuration Profiles
 
