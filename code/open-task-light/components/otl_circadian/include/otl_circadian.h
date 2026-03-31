@@ -13,6 +13,7 @@ typedef void (*otl_circadian_apply_fn_t)(float cool_ratio, void *ctx);
 typedef struct {
     int coolest_seconds;
     int warmest_seconds;
+    int morning_ramp_seconds;
 } otl_circadian_schedule_t;
 
 typedef bool (*otl_circadian_schedule_getter_fn_t)(otl_circadian_schedule_t *schedule,

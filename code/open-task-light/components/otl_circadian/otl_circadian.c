@@ -138,11 +138,22 @@ static void circadian_get_schedule(otl_circadian_schedule_t *schedule)
         CONFIG_OTL_CIRCADIAN_WARMEST_TIME,
         23 * 3600,
         "CONFIG_OTL_CIRCADIAN_WARMEST_TIME");
+    schedule->morning_ramp_seconds = (int)CONFIG_OTL_CIRCADIAN_MORNING_RAMP_DURATION_MIN * 60;
+}
+
+static int seconds_forward_between(int start_sec, int end_sec)
+{
+    int delta = end_sec - start_sec;
+    if (delta < 0) {
+        delta += SECONDS_PER_DAY;
+    }
+    return delta;
 }
 
 static float circadian_compute_cool_ratio(const struct tm *local_time,
                                           int coolest_sec,
-                                          int warmest_sec)
+                                          int warmest_sec,
+                                          int morning_ramp_sec)
 {
     const int sec_of_day = (local_time->tm_hour * 3600) + (local_time->tm_min * 60) + local_time->tm_sec;
 
@@ -159,23 +170,28 @@ static float circadian_compute_cool_ratio(const struct tm *local_time,
         const float phase = (2.0f * (float)M_PI * seconds_delta) / (float)SECONDS_PER_DAY;
         base = 0.5f + 0.5f * cosf(phase);  // 1 @ coolest, 0 @ coolest+12h
     } else {
-        // Piecewise cosine interpolation between warmest and coolest times.
-        int rise_duration_sec = coolest_sec - warmest_sec;
-        if (rise_duration_sec < 0) {
-            rise_duration_sec += SECONDS_PER_DAY;
-        }
+        const int warm_to_cool_duration_sec = seconds_forward_between(warmest_sec, coolest_sec);
+        const int clamped_morning_ramp_sec = morning_ramp_sec <= 0
+            ? 0
+            : ((morning_ramp_sec < warm_to_cool_duration_sec)
+                ? morning_ramp_sec
+                : warm_to_cool_duration_sec);
+        const int warm_hold_duration_sec = warm_to_cool_duration_sec - clamped_morning_ramp_sec;
+        const int fall_duration_sec = SECONDS_PER_DAY - warm_to_cool_duration_sec;
+        const int elapsed_from_warmest = seconds_forward_between(warmest_sec, sec_of_day);
 
-        int elapsed_from_warmest = sec_of_day - warmest_sec;
-        if (elapsed_from_warmest < 0) {
-            elapsed_from_warmest += SECONDS_PER_DAY;
-        }
-
-        if (elapsed_from_warmest <= rise_duration_sec) {
-            float t = (float)elapsed_from_warmest / (float)rise_duration_sec; // 0..1
-            base = 0.5f - 0.5f * cosf((float)M_PI * t);                        // 0->1
+        if (elapsed_from_warmest < warm_hold_duration_sec) {
+            base = 0.0f;
+        } else if (elapsed_from_warmest <= warm_to_cool_duration_sec) {
+            if (clamped_morning_ramp_sec <= 0) {
+                base = 1.0f;
+            } else {
+                const int elapsed_rise = elapsed_from_warmest - warm_hold_duration_sec;
+                float t = (float)elapsed_rise / (float)clamped_morning_ramp_sec; // 0..1
+                base = 0.5f - 0.5f * cosf((float)M_PI * t);                       // 0->1
+            }
         } else {
-            const int fall_duration_sec = SECONDS_PER_DAY - rise_duration_sec;
-            const int elapsed_fall = elapsed_from_warmest - rise_duration_sec;
+            const int elapsed_fall = elapsed_from_warmest - warm_to_cool_duration_sec;
             float t = (float)elapsed_fall / (float)fall_duration_sec;          // 0..1
             base = 0.5f + 0.5f * cosf((float)M_PI * t);                        // 1->0
         }
@@ -233,7 +249,8 @@ static void circadian_task(void *arg)
         if (timeinfo.tm_year >= (2020 - 1900)) {
             float ratio = circadian_compute_cool_ratio(&timeinfo,
                                                        schedule.coolest_seconds,
-                                                       schedule.warmest_seconds);
+                                                       schedule.warmest_seconds,
+                                                       schedule.morning_ramp_seconds);
             if (last_ratio < 0.0f || fabsf(ratio - last_ratio) >= 0.0005f) {
                 last_ratio = ratio;
                 if (s_apply_cb != NULL) {

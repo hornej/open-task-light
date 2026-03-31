@@ -611,12 +611,14 @@ static float temp_ratio         = 0.5f;  // 0.0 warm … 1.0 cool
 #define OTL_RUNTIME_DEFAULT_CIRCADIAN_ENABLED true
 #define OTL_RUNTIME_DEFAULT_CIRCADIAN_COOLEST_TIME CONFIG_OTL_CIRCADIAN_COOLEST_TIME
 #define OTL_RUNTIME_DEFAULT_CIRCADIAN_WARMEST_TIME CONFIG_OTL_CIRCADIAN_WARMEST_TIME
+#define OTL_RUNTIME_DEFAULT_CIRCADIAN_MORNING_RAMP_MINUTES CONFIG_OTL_CIRCADIAN_MORNING_RAMP_DURATION_MIN
 static float circadian_base_ratio = 0.5f;     // 0.0 warm .. 1.0 cool
 static float temp_ratio_user_offset = 0.0f;   // applied on top of circadian_base_ratio
 #else
 #define OTL_RUNTIME_DEFAULT_CIRCADIAN_ENABLED false
 #define OTL_RUNTIME_DEFAULT_CIRCADIAN_COOLEST_TIME "11:00"
 #define OTL_RUNTIME_DEFAULT_CIRCADIAN_WARMEST_TIME "23:00"
+#define OTL_RUNTIME_DEFAULT_CIRCADIAN_MORNING_RAMP_MINUTES 180
 #endif
 
 #ifdef CONFIG_OTL_LOG_STATUS
@@ -666,14 +668,20 @@ static float temp_ratio_user_offset = 0.0f;   // applied on top of circadian_bas
 #endif
 
 #define OTL_RUNTIME_DEFAULT_OCCUPANCY_AUTO_OFF_ENABLED true
+#if CONFIG_OTL_PRESENCE_SENSOR
 #define OTL_RUNTIME_DEFAULT_RADAR_MOTION_MAX_DISTANCE_CM ((uint16_t)CONFIG_OTL_RADAR_MOVING_MAX_DISTANCE_CM)
 #define OTL_RUNTIME_DEFAULT_RADAR_STATIONARY_MAX_DISTANCE_CM ((uint16_t)CONFIG_OTL_RADAR_STATIONARY_MAX_DISTANCE_CM)
+#else
+#define OTL_RUNTIME_DEFAULT_RADAR_MOTION_MAX_DISTANCE_CM 300U
+#define OTL_RUNTIME_DEFAULT_RADAR_STATIONARY_MAX_DISTANCE_CM 500U
+#endif
 #define OTL_RUNTIME_RADAR_DISTANCE_MIN_CM 50U
 #define OTL_RUNTIME_RADAR_DISTANCE_MAX_CM 600U
 
 static bool runtime_circadian_enabled = OTL_RUNTIME_DEFAULT_CIRCADIAN_ENABLED;
 static char runtime_circadian_coolest_time[OTL_RUNTIME_TIME_STR_LEN] = OTL_RUNTIME_DEFAULT_CIRCADIAN_COOLEST_TIME;
 static char runtime_circadian_warmest_time[OTL_RUNTIME_TIME_STR_LEN] = OTL_RUNTIME_DEFAULT_CIRCADIAN_WARMEST_TIME;
+static uint16_t runtime_circadian_morning_ramp_minutes = OTL_RUNTIME_DEFAULT_CIRCADIAN_MORNING_RAMP_MINUTES;
 static bool runtime_verbose_diagnostics_enabled = false;
 static bool runtime_status_logging_enabled = OTL_RUNTIME_DEFAULT_STATUS_LOGGING_ENABLED;
 static bool runtime_sensor_debug_logging_enabled = OTL_RUNTIME_DEFAULT_SENSOR_DEBUG_LOGGING_ENABLED;
@@ -708,6 +716,8 @@ static const float MIN_BRIGHTNESS_HOLD_EPSILON_PERCENT = 0.5f;
 #define OTL_NTC_SAMPLE_COUNT                     5
 #define OTL_RUNTIME_LED_THERM_LIMIT_MIN_C        60.0f
 #define OTL_RUNTIME_LED_THERM_LIMIT_MAX_C        110.0f
+#define OTL_RUNTIME_CIRCADIAN_RAMP_MIN_MINUTES   0U
+#define OTL_RUNTIME_CIRCADIAN_RAMP_MAX_MINUTES   1440U
 
 static volatile bool thermal_ntc_hot = false;
 static volatile bool thermal_chip_hot = false;
@@ -1375,6 +1385,7 @@ static void update_outputs(void);
 #define OTL_RUNTIME_KEY_CIRCADIAN_ENABLED "circ_en"
 #define OTL_RUNTIME_KEY_CIRCADIAN_COOL    "circ_cool"
 #define OTL_RUNTIME_KEY_CIRCADIAN_WARM    "circ_warm"
+#define OTL_RUNTIME_KEY_CIRCADIAN_RAMP    "circ_ramp"
 #define OTL_RUNTIME_KEY_LED_THERM_LIMIT   "led_tmax"
 #define OTL_RUNTIME_KEY_VERBOSE_DIAG      "diag_verbose"
 #define OTL_RUNTIME_KEY_STATUS_LOG        "log_status"
@@ -1492,6 +1503,7 @@ static void otl_runtime_settings_snapshot_locked(otl_runtime_settings_t *setting
              sizeof(settings->circadian_warmest_time),
              "%s",
              runtime_circadian_warmest_time);
+    settings->circadian_morning_ramp_minutes = (int)runtime_circadian_morning_ramp_minutes;
     settings->led_thermal_limit_c = runtime_led_thermal_limit_c;
     settings->verbose_diagnostics_enabled = runtime_verbose_diagnostics_enabled;
     settings->status_logging_enabled = runtime_status_logging_enabled;
@@ -1626,6 +1638,7 @@ static void otl_runtime_store_defaults_locked(void)
              sizeof(runtime_circadian_warmest_time),
              "%s",
              OTL_RUNTIME_DEFAULT_CIRCADIAN_WARMEST_TIME);
+    runtime_circadian_morning_ramp_minutes = OTL_RUNTIME_DEFAULT_CIRCADIAN_MORNING_RAMP_MINUTES;
     runtime_led_thermal_limit_c = OTL_THERMAL_NTC_HOT_C;
     runtime_verbose_diagnostics_enabled = false;
     runtime_status_logging_enabled = OTL_RUNTIME_DEFAULT_STATUS_LOGGING_ENABLED;
@@ -1924,6 +1937,7 @@ static esp_err_t otl_runtime_settings_init(void)
     float led_thermal_limit_c = OTL_THERMAL_NTC_HOT_C;
     char coolest_time[OTL_RUNTIME_TIME_STR_LEN] = OTL_RUNTIME_DEFAULT_CIRCADIAN_COOLEST_TIME;
     char warmest_time[OTL_RUNTIME_TIME_STR_LEN] = OTL_RUNTIME_DEFAULT_CIRCADIAN_WARMEST_TIME;
+    uint16_t morning_ramp_minutes = OTL_RUNTIME_DEFAULT_CIRCADIAN_MORNING_RAMP_MINUTES;
     uint8_t stored_u8 = 0;
     uint16_t stored_u16 = 0;
     char stored_time[OTL_RUNTIME_TIME_STR_LEN] = {0};
@@ -1955,6 +1969,10 @@ static esp_err_t otl_runtime_settings_init(void)
         if (nvs_get_str(handle, OTL_RUNTIME_KEY_CIRCADIAN_WARM, stored_time, &stored_len) == ESP_OK &&
             otl_runtime_parse_hhmm_seconds(stored_time, &(int){0})) {
             snprintf(warmest_time, sizeof(warmest_time), "%s", stored_time);
+        }
+        if (nvs_get_u16(handle, OTL_RUNTIME_KEY_CIRCADIAN_RAMP, &stored_u16) == ESP_OK &&
+            stored_u16 <= OTL_RUNTIME_CIRCADIAN_RAMP_MAX_MINUTES) {
+            morning_ramp_minutes = stored_u16;
         }
 #endif
         if (nvs_get_u8(handle, OTL_RUNTIME_KEY_VERBOSE_DIAG, &stored_u8) == ESP_OK) {
@@ -2012,6 +2030,7 @@ static esp_err_t otl_runtime_settings_init(void)
     runtime_circadian_enabled = circadian_enabled;
     snprintf(runtime_circadian_coolest_time, sizeof(runtime_circadian_coolest_time), "%s", coolest_time);
     snprintf(runtime_circadian_warmest_time, sizeof(runtime_circadian_warmest_time), "%s", warmest_time);
+    runtime_circadian_morning_ramp_minutes = morning_ramp_minutes;
 #endif
     runtime_led_thermal_limit_c = led_thermal_limit_c;
     runtime_verbose_diagnostics_enabled = verbose_enabled;
@@ -2280,13 +2299,15 @@ bool otl_runtime_circadian_is_enabled(void)
 #endif
 }
 
-bool otl_runtime_get_circadian_schedule(int *coolest_seconds, int *warmest_seconds)
+bool otl_runtime_get_circadian_schedule(int *coolest_seconds,
+                                        int *warmest_seconds,
+                                        int *morning_ramp_seconds)
 {
     otl_runtime_settings_t settings = {0};
     int coolest = 0;
     int warmest = 0;
 
-    if (coolest_seconds == NULL || warmest_seconds == NULL) {
+    if (coolest_seconds == NULL || warmest_seconds == NULL || morning_ramp_seconds == NULL) {
         return false;
     }
 
@@ -2298,6 +2319,7 @@ bool otl_runtime_get_circadian_schedule(int *coolest_seconds, int *warmest_secon
 
     *coolest_seconds = coolest;
     *warmest_seconds = warmest;
+    *morning_ramp_seconds = settings.circadian_morning_ramp_minutes * 60;
     return true;
 }
 
@@ -2538,6 +2560,40 @@ esp_err_t otl_runtime_set_circadian_warmest_time(const char *hhmm, otl_change_so
     return ESP_OK;
 }
 
+esp_err_t otl_runtime_set_circadian_morning_ramp_minutes(int minutes, otl_change_source_t source)
+{
+    otl_runtime_settings_t settings = {0};
+    char event_message[OTL_RUNTIME_EVENT_MESSAGE_LEN] = {0};
+    uint16_t normalized_minutes = 0;
+
+    if (minutes < (int)OTL_RUNTIME_CIRCADIAN_RAMP_MIN_MINUTES ||
+        minutes > (int)OTL_RUNTIME_CIRCADIAN_RAMP_MAX_MINUTES) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    normalized_minutes = (uint16_t)minutes;
+    ESP_RETURN_ON_ERROR(otl_runtime_save_u16(OTL_RUNTIME_KEY_CIRCADIAN_RAMP, normalized_minutes),
+                        "runtime",
+                        "Failed to save circadian morning ramp");
+
+    otl_state_lock();
+    if (runtime_circadian_morning_ramp_minutes == normalized_minutes) {
+        otl_state_unlock();
+        return ESP_OK;
+    }
+    runtime_circadian_morning_ramp_minutes = normalized_minutes;
+    otl_runtime_settings_snapshot_locked(&settings);
+    otl_state_unlock();
+
+    otl_runtime_settings_notify_listeners(&settings, source);
+    snprintf(event_message,
+             sizeof(event_message),
+             "Updated circadian morning ramp to %d minutes",
+             minutes);
+    otl_event_emit(OTL_EVENT_LEVEL_INFO, "circadian", event_message);
+    return ESP_OK;
+}
+
 esp_err_t otl_runtime_set_led_thermal_limit_c(float limit_c, otl_change_source_t source)
 {
     otl_runtime_settings_t settings = {0};
@@ -2722,6 +2778,7 @@ static bool otl_telemetry_update(float lux,
     return changed;
 }
 
+#if CONFIG_OTL_PRESENCE_SENSOR
 static bool otl_telemetry_update_radar(bool motion_detected,
                                        int motion_distance_cm,
                                        int stationary_distance_cm)
@@ -2774,6 +2831,7 @@ static bool otl_telemetry_update_radar(bool motion_detected,
 
     return changed || should_notify;
 }
+#endif
 
 static void thermal_update(float ntc_c, float chip_c)
 {
@@ -2863,7 +2921,8 @@ static bool otl_circadian_schedule_getter(otl_circadian_schedule_t *schedule, vo
     }
 
     return otl_runtime_get_circadian_schedule(&schedule->coolest_seconds,
-                                              &schedule->warmest_seconds);
+                                              &schedule->warmest_seconds,
+                                              &schedule->morning_ramp_seconds);
 }
 
 static void otl_circadian_apply_cb(float base_ratio, void *ctx)

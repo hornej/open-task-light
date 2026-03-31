@@ -91,6 +91,9 @@ typedef struct {
     char circadian_warmest_state_topic[OTL_MQTT_TOPIC_MAX];
     char circadian_warmest_command_topic[OTL_MQTT_TOPIC_MAX];
     char circadian_warmest_discovery_topic[OTL_MQTT_TOPIC_MAX];
+    char circadian_morning_ramp_state_topic[OTL_MQTT_TOPIC_MAX];
+    char circadian_morning_ramp_command_topic[OTL_MQTT_TOPIC_MAX];
+    char circadian_morning_ramp_discovery_topic[OTL_MQTT_TOPIC_MAX];
 #endif
     char verbose_diag_state_topic[OTL_MQTT_TOPIC_MAX];
     char verbose_diag_command_topic[OTL_MQTT_TOPIC_MAX];
@@ -152,6 +155,7 @@ typedef esp_err_t (*otl_mqtt_bool_setting_setter_fn)(bool enabled, otl_change_so
 static esp_err_t otl_mqtt_build_topics(void);
 static esp_err_t otl_mqtt_publish_discovery_payload(const char *topic, const char *payload);
 static void otl_mqtt_publish(const char *topic, const char *payload, bool retain);
+static void otl_mqtt_cleanup_stale_discovery(void);
 static void otl_mqtt_event_handler(void *handler_args,
                                    esp_event_base_t base,
                                    int32_t event_id,
@@ -572,6 +576,7 @@ static float otl_mqtt_mired_to_temp_ratio(int mired)
     return (OTL_MQTT_WARM_MIRED - clamped) / (OTL_MQTT_WARM_MIRED - OTL_MQTT_COOL_MIRED);
 }
 
+#if CONFIG_OTL_PRESENCE_SENSOR
 static float otl_mqtt_cm_to_feet(float cm)
 {
     return cm / OTL_MQTT_CM_PER_FOOT;
@@ -581,6 +586,7 @@ static int otl_mqtt_feet_to_cm(float feet)
 {
     return (int)lroundf(feet * OTL_MQTT_CM_PER_FOOT);
 }
+#endif
 
 static void otl_mqtt_publish(const char *topic, const char *payload, bool retain)
 {
@@ -699,6 +705,9 @@ static void otl_mqtt_publish_settings(const otl_runtime_settings_t *settings)
     otl_mqtt_publish(s_mqtt.circadian_warmest_state_topic,
                      settings->circadian_warmest_time,
                      true);
+    otl_mqtt_publish_int(s_mqtt.circadian_morning_ramp_state_topic,
+                         settings->circadian_morning_ramp_minutes,
+                         true);
 #endif
     otl_mqtt_publish_float(s_mqtt.led_thermal_limit_state_topic,
                            settings->led_thermal_limit_c,
@@ -825,6 +834,33 @@ static esp_err_t otl_mqtt_publish_discovery_payload(const char *topic, const cha
 
     otl_mqtt_publish(topic, payload, true);
     return ESP_OK;
+}
+
+static void otl_mqtt_cleanup_stale_discovery(void)
+{
+#if !CONFIG_OTL_PRESENCE_SENSOR
+    static const char *const stale_presence_topics[] = {
+        "%s/binary_sensor/%s_occupancy/config",
+        "%s/binary_sensor/%s_motion/config",
+        "%s/sensor/%s_motion_distance/config",
+        "%s/sensor/%s_stationary_distance/config",
+        "%s/number/%s_motion_max_distance/config",
+        "%s/number/%s_stationary_max_distance/config",
+        "%s/switch/%s_radar_status_logs/config",
+        "%s/switch/%s_occupancy_auto_off/config",
+    };
+    char topic[OTL_MQTT_TOPIC_MAX] = {0};
+
+    for (size_t i = 0; i < sizeof(stale_presence_topics) / sizeof(stale_presence_topics[0]); ++i) {
+        if (otl_mqtt_format_topic(topic,
+                                  sizeof(topic),
+                                  stale_presence_topics[i],
+                                  CONFIG_OTL_MQTT_DISCOVERY_PREFIX,
+                                  s_mqtt.device_id) == ESP_OK) {
+            otl_mqtt_publish(topic, "", true);
+        }
+    }
+#endif
 }
 
 static void otl_mqtt_publish_discovery(void)
@@ -1281,6 +1317,35 @@ static void otl_mqtt_publish_discovery(void)
         free(payload);
         payload = NULL;
     }
+
+    payload = otl_mqtt_alloc_printf(
+        "{"
+        "\"name\":\"Circadian Morning Ramp\","
+        "\"unique_id\":\"%s_circadian_morning_ramp\","
+        "\"command_topic\":\"%s\","
+        "\"state_topic\":\"%s\","
+        "\"min\":0,"
+        "\"max\":1440,"
+        "\"step\":15,"
+        "\"mode\":\"box\","
+        "\"unit_of_measurement\":\"min\","
+        "\"icon\":\"mdi:weather-sunset-up\","
+        "\"entity_category\":\"config\","
+        "\"availability_topic\":\"%s\","
+        "\"payload_available\":\"online\","
+        "\"payload_not_available\":\"offline\","
+        "%s"
+        "}",
+        s_mqtt.device_id,
+        s_mqtt.circadian_morning_ramp_command_topic,
+        s_mqtt.circadian_morning_ramp_state_topic,
+        s_mqtt.availability_topic,
+        device_json);
+    if (payload != NULL) {
+        (void)otl_mqtt_publish_discovery_payload(s_mqtt.circadian_morning_ramp_discovery_topic, payload);
+        free(payload);
+        payload = NULL;
+    }
 #endif
 
     payload = otl_mqtt_alloc_printf(
@@ -1640,6 +1705,20 @@ static void otl_mqtt_handle_command(esp_mqtt_event_handle_t event)
         otl_mqtt_trim(payload);
         if (otl_runtime_set_circadian_warmest_time(payload, OTL_CHANGE_SOURCE_MQTT) != ESP_OK) {
             otl_event_emit(OTL_EVENT_LEVEL_WARNING, "mqtt", "Rejected warmest time write");
+            otl_mqtt_republish_settings_after_invalid_write();
+        }
+        return;
+    }
+
+    if (otl_mqtt_topic_matches(event, s_mqtt.circadian_morning_ramp_command_topic)) {
+        int minutes = 0;
+        if (!otl_mqtt_parse_int_payload(event, &minutes)) {
+            otl_event_emit(OTL_EVENT_LEVEL_WARNING, "mqtt", "Rejected circadian morning ramp write");
+            otl_mqtt_republish_settings_after_invalid_write();
+            return;
+        }
+        if (otl_runtime_set_circadian_morning_ramp_minutes(minutes, OTL_CHANGE_SOURCE_MQTT) != ESP_OK) {
+            otl_event_emit(OTL_EVENT_LEVEL_WARNING, "mqtt", "Rejected circadian morning ramp write");
             otl_mqtt_republish_settings_after_invalid_write();
         }
         return;
@@ -2056,6 +2135,25 @@ static esp_err_t otl_mqtt_build_topics(void)
                                               s_mqtt.device_id),
                         TAG,
                         "MQTT warmest time discovery topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.circadian_morning_ramp_state_topic,
+                                              sizeof(s_mqtt.circadian_morning_ramp_state_topic),
+                                              "%s/circadian/morning_ramp/state",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT morning ramp state topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.circadian_morning_ramp_command_topic,
+                                              sizeof(s_mqtt.circadian_morning_ramp_command_topic),
+                                              "%s/circadian/morning_ramp/set",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT morning ramp command topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.circadian_morning_ramp_discovery_topic,
+                                              sizeof(s_mqtt.circadian_morning_ramp_discovery_topic),
+                                              "%s/number/%s_circadian_morning_ramp/config",
+                                              CONFIG_OTL_MQTT_DISCOVERY_PREFIX,
+                                              s_mqtt.device_id),
+                        TAG,
+                        "MQTT morning ramp discovery topic too long");
 #endif
     ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.verbose_diag_state_topic,
                                               sizeof(s_mqtt.verbose_diag_state_topic),
@@ -2359,6 +2457,7 @@ static void otl_mqtt_event_handler(void *handler_args,
             esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.circadian_enabled_command_topic, 1);
             esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.circadian_coolest_command_topic, 1);
             esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.circadian_warmest_command_topic, 1);
+            esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.circadian_morning_ramp_command_topic, 1);
 #endif
             esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.led_thermal_limit_command_topic, 1);
             esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.verbose_diag_command_topic, 1);
@@ -2374,6 +2473,7 @@ static void otl_mqtt_event_handler(void *handler_args,
             esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.radar_stationary_max_distance_command_topic, 1);
             esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.occupancy_auto_off_command_topic, 1);
 #endif
+            otl_mqtt_cleanup_stale_discovery();
             otl_mqtt_publish_discovery();
             otl_mqtt_publish(s_mqtt.availability_topic, "online", true);
             otl_mqtt_publish_build_info();

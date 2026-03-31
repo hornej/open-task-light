@@ -309,6 +309,17 @@ config OTL_CIRCADIAN_WARMEST_TIME
     help
         Local time in 24-hour format. Examples: 19:30, 21:00, 00:15.
 
+config OTL_CIRCADIAN_MORNING_RAMP_DURATION_MIN
+    int "Morning cool ramp duration (minutes)"
+    range 0 1440
+    default 180
+    help
+        How long the morning transition from fully warm to the coolest point
+        should last. The light stays at maximum warmth after the warmest time
+        until this ramp window begins. Example: with warmest=20:00,
+        coolest=09:00, and ramp=180, the light stays fully warm until 06:00
+        and then cools from 06:00 to 09:00.
+
 config OTL_CIRCADIAN_COOL_MIN_PCT
     int "Minimum cool ratio (%)"
     range 0 100

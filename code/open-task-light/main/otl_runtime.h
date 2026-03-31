@@ -59,6 +59,7 @@ typedef struct {
     bool circadian_enabled;
     char circadian_coolest_time[OTL_RUNTIME_TIME_STR_LEN];
     char circadian_warmest_time[OTL_RUNTIME_TIME_STR_LEN];
+    int circadian_morning_ramp_minutes;
     float led_thermal_limit_c;
     bool verbose_diagnostics_enabled;
     bool status_logging_enabled;
@@ -108,7 +109,9 @@ esp_err_t otl_runtime_settings_add_listener(otl_runtime_settings_listener_fn lis
 void otl_runtime_settings_notify_current(otl_change_source_t source);
 bool otl_runtime_verbose_diagnostics_enabled(void);
 bool otl_runtime_circadian_is_enabled(void);
-bool otl_runtime_get_circadian_schedule(int *coolest_seconds, int *warmest_seconds);
+bool otl_runtime_get_circadian_schedule(int *coolest_seconds,
+                                        int *warmest_seconds,
+                                        int *morning_ramp_seconds);
 esp_err_t otl_runtime_set_verbose_diagnostics(bool enabled, otl_change_source_t source);
 esp_err_t otl_runtime_set_status_logging_enabled(bool enabled, otl_change_source_t source);
 esp_err_t otl_runtime_set_sensor_debug_logging_enabled(bool enabled, otl_change_source_t source);
@@ -123,6 +126,7 @@ esp_err_t otl_runtime_set_radar_stationary_max_distance_cm(int limit_cm, otl_cha
 esp_err_t otl_runtime_set_circadian_enabled(bool enabled, otl_change_source_t source);
 esp_err_t otl_runtime_set_circadian_coolest_time(const char *hhmm, otl_change_source_t source);
 esp_err_t otl_runtime_set_circadian_warmest_time(const char *hhmm, otl_change_source_t source);
+esp_err_t otl_runtime_set_circadian_morning_ramp_minutes(int minutes, otl_change_source_t source);
 esp_err_t otl_runtime_set_led_thermal_limit_c(float limit_c, otl_change_source_t source);
 
 void otl_event_get_last(otl_runtime_event_t *event);

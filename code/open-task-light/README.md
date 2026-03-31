@@ -158,6 +158,7 @@ The firmware publishes a native Home Assistant MQTT device with:
   - circadian lighting enable
   - circadian lighting coolest time
   - circadian lighting warmest time
+  - circadian morning ramp duration
   - verbose diagnostics
 
 Important behavior:
@@ -213,11 +214,15 @@ Compile-time circadian settings:
 - `Update interval`
 - `Coolest time (HH:MM)`
 - `Warmest time (HH:MM)`
+- `Morning cool ramp duration (minutes)`
 - `Minimum cool ratio (%)`
 - `Maximum cool ratio (%)`
 
 Runtime behavior:
 - the circadian engine computes a base warm/cool mix across the day
+- after the warmest time, the light can hold maximum warmth overnight and only
+  start cooling during the configurable morning ramp window before the coolest
+  time
 - temperature touch controls act as a user offset on top of that base
 - if MQTT is enabled, Home Assistant can turn circadian lighting on or off at runtime
 - if you want Home Assistant to own color temperature policy, disable circadian
