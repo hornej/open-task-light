@@ -62,6 +62,7 @@ Optional connected behavior in the native firmware:
 If the LD2410B presence sensor is installed and enabled:
 - occupancy turns on only after continuous presence for the configured on delay
 - occupancy turns off only after continuous absence for the configured timeout
+  (120 seconds by default)
 - when occupancy clears, the light fades out
 - when occupancy returns, the light fades back to its previous state
 
@@ -110,7 +111,8 @@ Under `Open Task Light`, the important sections are:
   - `Enable Apple Home via HomeKit`
 - `Presence sensor`
   - LD2410B enable, optional first-boot Bluetooth disable, distance thresholds,
-    on/off delay, polling interval
+    on/off delay, polling interval, UART sample stale timeout, UART
+    auto-recovery interval
 - `PWM`
   - non-overlapping warm/cool PWM
 - `Circadian lighting`
@@ -146,6 +148,8 @@ The firmware publishes a native Home Assistant MQTT device with:
   - color temperature
 - occupancy binary sensor when presence is enabled
 - telemetry and diagnostics
+  - radar OUT pin state
+  - radar UART state
   - ambient lux
   - LED NTC temperature
   - ESP32-S3 internal temperature
@@ -155,6 +159,7 @@ The firmware publishes a native Home Assistant MQTT device with:
   - last event
 - runtime controls
   - LED thermal limit
+  - radar occupancy off timeout
   - circadian lighting enable
   - circadian lighting coolest time
   - circadian lighting warmest time
@@ -166,6 +171,11 @@ Important behavior:
   HomeKit when multiple integrations are enabled
 - circadian lighting is runtime-toggleable from Home Assistant so it does not
   have to fight Adaptive Lighting or your own automations
+- when the LD2410 UART stream goes stale, the radar presence/motion entities
+  are marked unavailable in Home Assistant instead of falsely reading clear,
+  while the radar UART diagnostic sensor reports `stale` or `no_response`
+- the raw `Radar OUT` entity is published separately for Home Assistant
+  visibility, but it is not used for the light auto-off logic
 - the MQTT integration also publishes a structured event stream and a `Last Event`
   text sensor instead of mirroring raw serial logs
 

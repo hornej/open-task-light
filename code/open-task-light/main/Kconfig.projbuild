@@ -231,7 +231,7 @@ config OTL_RADAR_PRESENCE_ON_DELAY_MS
 config OTL_RADAR_ABSENCE_TIMEOUT_MS
     int "Absence timeout (ms)"
     range 1000 600000
-    default 30000
+    default 120000
     help
         Absence must be continuous for at least this long before occupancy
         turns off.
@@ -242,6 +242,28 @@ config OTL_RADAR_TASK_LOOP_MS
     default 50
     help
         Poll interval for radar UART/presence processing.
+
+config OTL_RADAR_SAMPLE_STALE_TIMEOUT_MS
+    int "Radar UART sample stale timeout (ms)"
+    range 100 10000
+    default 1500
+    help
+        Treat the most recent LD2410 UART sample as stale after this long.
+        This prevents old distance values from holding occupancy on if the
+        radar stops reporting or leaves the last distances latched after the
+        target clears. Home Assistant radar entities also use this to mark
+        the radar data unavailable instead of falsely reading clear.
+
+config OTL_RADAR_UART_RECOVERY_INTERVAL_MS
+    int "Radar UART auto-recovery interval (ms)"
+    range 1000 600000
+    default 10000
+    help
+        If the LD2410 stops delivering fresh UART frames for at least this
+        long, the firmware sends a blind UART restart sequence to try to
+        recover streaming without a full lamp power cycle. The MQTT
+        diagnostic state also changes from stale to no_response once this
+        interval is exceeded.
 
 endmenu
 

@@ -61,10 +61,15 @@ typedef struct {
     char occupancy_discovery_topic[OTL_MQTT_TOPIC_MAX];
     char motion_state_topic[OTL_MQTT_TOPIC_MAX];
     char motion_discovery_topic[OTL_MQTT_TOPIC_MAX];
+    char radar_out_state_topic[OTL_MQTT_TOPIC_MAX];
+    char radar_out_discovery_topic[OTL_MQTT_TOPIC_MAX];
     char motion_distance_state_topic[OTL_MQTT_TOPIC_MAX];
     char motion_distance_discovery_topic[OTL_MQTT_TOPIC_MAX];
     char stationary_distance_state_topic[OTL_MQTT_TOPIC_MAX];
     char stationary_distance_discovery_topic[OTL_MQTT_TOPIC_MAX];
+    char radar_availability_topic[OTL_MQTT_TOPIC_MAX];
+    char radar_uart_state_topic[OTL_MQTT_TOPIC_MAX];
+    char radar_uart_state_discovery_topic[OTL_MQTT_TOPIC_MAX];
 #endif
     char ambient_lux_state_topic[OTL_MQTT_TOPIC_MAX];
     char ambient_lux_discovery_topic[OTL_MQTT_TOPIC_MAX];
@@ -126,6 +131,9 @@ typedef struct {
     char radar_stationary_max_distance_state_topic[OTL_MQTT_TOPIC_MAX];
     char radar_stationary_max_distance_command_topic[OTL_MQTT_TOPIC_MAX];
     char radar_stationary_max_distance_discovery_topic[OTL_MQTT_TOPIC_MAX];
+    char radar_absence_timeout_state_topic[OTL_MQTT_TOPIC_MAX];
+    char radar_absence_timeout_command_topic[OTL_MQTT_TOPIC_MAX];
+    char radar_absence_timeout_discovery_topic[OTL_MQTT_TOPIC_MAX];
     char occupancy_auto_off_state_topic[OTL_MQTT_TOPIC_MAX];
     char occupancy_auto_off_command_topic[OTL_MQTT_TOPIC_MAX];
     char occupancy_auto_off_discovery_topic[OTL_MQTT_TOPIC_MAX];
@@ -586,6 +594,20 @@ static int otl_mqtt_feet_to_cm(float feet)
 {
     return (int)lroundf(feet * OTL_MQTT_CM_PER_FOOT);
 }
+
+static const char *otl_mqtt_radar_uart_state_to_string(otl_radar_uart_state_t state)
+{
+    switch (state) {
+        case OTL_RADAR_UART_STATE_OK:
+            return "ok";
+        case OTL_RADAR_UART_STATE_STALE:
+            return "stale";
+        case OTL_RADAR_UART_STATE_NO_RESPONSE:
+            return "no_response";
+        default:
+            return "unknown";
+    }
+}
 #endif
 
 static void otl_mqtt_publish(const char *topic, const char *payload, bool retain)
@@ -672,9 +694,17 @@ static void otl_mqtt_publish_telemetry(const otl_telemetry_t *telemetry)
                      telemetry->thermal_limited ? "ON" : "OFF",
                      true);
 #if CONFIG_OTL_PRESENCE_SENSOR
+    otl_mqtt_publish(s_mqtt.radar_availability_topic,
+                     telemetry->radar_uart_state == OTL_RADAR_UART_STATE_OK ? "online" : "offline",
+                     true);
+    otl_mqtt_publish(s_mqtt.radar_uart_state_topic,
+                     otl_mqtt_radar_uart_state_to_string(telemetry->radar_uart_state),
+                     true);
     otl_mqtt_publish(s_mqtt.motion_state_topic,
                      telemetry->radar_motion_detected ? "ON" : "OFF",
                      true);
+    otl_mqtt_publish_bool_state(s_mqtt.radar_out_state_topic,
+                                telemetry->radar_out_asserted);
     otl_mqtt_publish_float(s_mqtt.motion_distance_state_topic,
                            otl_mqtt_cm_to_feet((float)telemetry->radar_motion_distance_cm),
                            1,
@@ -738,6 +768,9 @@ static void otl_mqtt_publish_settings(const otl_runtime_settings_t *settings)
                            otl_mqtt_cm_to_feet((float)settings->radar_stationary_max_distance_cm),
                            1,
                            true);
+    otl_mqtt_publish_int(s_mqtt.radar_absence_timeout_state_topic,
+                         settings->radar_absence_timeout_ms / 1000,
+                         true);
     otl_mqtt_publish_bool_state(s_mqtt.occupancy_auto_off_state_topic,
                                 settings->occupancy_auto_off_enabled);
 #endif
@@ -842,8 +875,11 @@ static void otl_mqtt_cleanup_stale_discovery(void)
     static const char *const stale_presence_topics[] = {
         "%s/binary_sensor/%s_occupancy/config",
         "%s/binary_sensor/%s_motion/config",
+        "%s/binary_sensor/%s_radar_out/config",
         "%s/sensor/%s_motion_distance/config",
         "%s/sensor/%s_stationary_distance/config",
+        "%s/sensor/%s_radar_uart_state/config",
+        "%s/number/%s_radar_absence_timeout/config",
         "%s/number/%s_motion_max_distance/config",
         "%s/number/%s_stationary_max_distance/config",
         "%s/switch/%s_radar_status_logs/config",
@@ -916,14 +952,17 @@ static void otl_mqtt_publish_discovery(void)
         "\"device_class\":\"occupancy\","
         "\"payload_on\":\"ON\","
         "\"payload_off\":\"OFF\","
-        "\"availability_topic\":\"%s\","
-        "\"payload_available\":\"online\","
-        "\"payload_not_available\":\"offline\","
+        "\"availability\":["
+        "{\"topic\":\"%s\",\"payload_available\":\"online\",\"payload_not_available\":\"offline\"},"
+        "{\"topic\":\"%s\",\"payload_available\":\"online\",\"payload_not_available\":\"offline\"}"
+        "],"
+        "\"availability_mode\":\"all\","
         "%s"
         "}",
         s_mqtt.device_id,
         s_mqtt.occupancy_state_topic,
         s_mqtt.availability_topic,
+        s_mqtt.radar_availability_topic,
         device_json);
     if (payload != NULL) {
         (void)otl_mqtt_publish_discovery_payload(s_mqtt.occupancy_discovery_topic, payload);
@@ -939,20 +978,31 @@ static void otl_mqtt_publish_discovery(void)
         "\"device_class\":\"motion\","
         "\"payload_on\":\"ON\","
         "\"payload_off\":\"OFF\","
-        "\"availability_topic\":\"%s\","
-        "\"payload_available\":\"online\","
-        "\"payload_not_available\":\"offline\","
+        "\"availability\":["
+        "{\"topic\":\"%s\",\"payload_available\":\"online\",\"payload_not_available\":\"offline\"},"
+        "{\"topic\":\"%s\",\"payload_available\":\"online\",\"payload_not_available\":\"offline\"}"
+        "],"
+        "\"availability_mode\":\"all\","
         "%s"
         "}",
         s_mqtt.device_id,
         s_mqtt.motion_state_topic,
         s_mqtt.availability_topic,
+        s_mqtt.radar_availability_topic,
         device_json);
     if (payload != NULL) {
         (void)otl_mqtt_publish_discovery_payload(s_mqtt.motion_discovery_topic, payload);
         free(payload);
         payload = NULL;
     }
+
+    otl_mqtt_publish_binary_sensor("Radar OUT",
+                                   "radar_out",
+                                   s_mqtt.radar_out_state_topic,
+                                   s_mqtt.radar_out_discovery_topic,
+                                   "mdi:radar",
+                                   "diagnostic",
+                                   device_json);
 
     payload = otl_mqtt_alloc_printf(
         "{"
@@ -963,14 +1013,17 @@ static void otl_mqtt_publish_discovery(void)
         "\"state_class\":\"measurement\","
         "\"entity_category\":\"diagnostic\","
         "\"icon\":\"mdi:ruler\","
-        "\"availability_topic\":\"%s\","
-        "\"payload_available\":\"online\","
-        "\"payload_not_available\":\"offline\","
+        "\"availability\":["
+        "{\"topic\":\"%s\",\"payload_available\":\"online\",\"payload_not_available\":\"offline\"},"
+        "{\"topic\":\"%s\",\"payload_available\":\"online\",\"payload_not_available\":\"offline\"}"
+        "],"
+        "\"availability_mode\":\"all\","
         "%s"
         "}",
         s_mqtt.device_id,
         s_mqtt.motion_distance_state_topic,
         s_mqtt.availability_topic,
+        s_mqtt.radar_availability_topic,
         device_json);
     if (payload != NULL) {
         (void)otl_mqtt_publish_discovery_payload(s_mqtt.motion_distance_discovery_topic, payload);
@@ -987,20 +1040,31 @@ static void otl_mqtt_publish_discovery(void)
         "\"state_class\":\"measurement\","
         "\"entity_category\":\"diagnostic\","
         "\"icon\":\"mdi:ruler\","
-        "\"availability_topic\":\"%s\","
-        "\"payload_available\":\"online\","
-        "\"payload_not_available\":\"offline\","
+        "\"availability\":["
+        "{\"topic\":\"%s\",\"payload_available\":\"online\",\"payload_not_available\":\"offline\"},"
+        "{\"topic\":\"%s\",\"payload_available\":\"online\",\"payload_not_available\":\"offline\"}"
+        "],"
+        "\"availability_mode\":\"all\","
         "%s"
         "}",
         s_mqtt.device_id,
         s_mqtt.stationary_distance_state_topic,
         s_mqtt.availability_topic,
+        s_mqtt.radar_availability_topic,
         device_json);
     if (payload != NULL) {
         (void)otl_mqtt_publish_discovery_payload(s_mqtt.stationary_distance_discovery_topic, payload);
         free(payload);
         payload = NULL;
     }
+
+    otl_mqtt_publish_text_sensor("Radar UART State",
+                                 "radar_uart_state",
+                                 s_mqtt.radar_uart_state_topic,
+                                 s_mqtt.radar_uart_state_discovery_topic,
+                                 "mdi:serial-port",
+                                 "diagnostic",
+                                 device_json);
 #endif
 
     payload = otl_mqtt_alloc_printf(
@@ -1229,6 +1293,35 @@ static void otl_mqtt_publish_discovery(void)
         device_json);
     if (payload != NULL) {
         (void)otl_mqtt_publish_discovery_payload(s_mqtt.radar_stationary_max_distance_discovery_topic, payload);
+        free(payload);
+        payload = NULL;
+    }
+
+    payload = otl_mqtt_alloc_printf(
+        "{"
+        "\"name\":\"Radar Occupancy Off Timeout\","
+        "\"unique_id\":\"%s_radar_absence_timeout\","
+        "\"command_topic\":\"%s\","
+        "\"state_topic\":\"%s\","
+        "\"unit_of_measurement\":\"s\","
+        "\"entity_category\":\"config\","
+        "\"min\":1,"
+        "\"max\":600,"
+        "\"step\":1,"
+        "\"mode\":\"box\","
+        "\"icon\":\"mdi:timer-outline\","
+        "\"availability_topic\":\"%s\","
+        "\"payload_available\":\"online\","
+        "\"payload_not_available\":\"offline\","
+        "%s"
+        "}",
+        s_mqtt.device_id,
+        s_mqtt.radar_absence_timeout_command_topic,
+        s_mqtt.radar_absence_timeout_state_topic,
+        s_mqtt.availability_topic,
+        device_json);
+    if (payload != NULL) {
+        (void)otl_mqtt_publish_discovery_payload(s_mqtt.radar_absence_timeout_discovery_topic, payload);
         free(payload);
         payload = NULL;
     }
@@ -1663,6 +1756,20 @@ static void otl_mqtt_handle_command(esp_mqtt_event_handle_t event)
                                              "Failed to update occupancy auto-off")) {
         return;
     }
+
+    if (otl_mqtt_topic_matches(event, s_mqtt.radar_absence_timeout_command_topic)) {
+        int timeout_s = 0;
+        if (!otl_mqtt_parse_int_payload(event, &timeout_s)) {
+            otl_event_emit(OTL_EVENT_LEVEL_WARNING, "mqtt", "Rejected occupancy off timeout write");
+            otl_mqtt_republish_settings_after_invalid_write();
+            return;
+        }
+        if (otl_runtime_set_radar_absence_timeout_ms(timeout_s * 1000, OTL_CHANGE_SOURCE_MQTT) != ESP_OK) {
+            otl_event_emit(OTL_EVENT_LEVEL_WARNING, "mqtt", "Rejected occupancy off timeout write");
+            otl_mqtt_republish_settings_after_invalid_write();
+        }
+        return;
+    }
 #endif
 
 #if CONFIG_OTL_CIRCADIAN_ENABLE
@@ -1913,6 +2020,19 @@ static esp_err_t otl_mqtt_build_topics(void)
                                               s_mqtt.device_id),
                         TAG,
                         "MQTT motion discovery topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.radar_out_state_topic,
+                                              sizeof(s_mqtt.radar_out_state_topic),
+                                              "%s/radar/out/state",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT radar OUT state topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.radar_out_discovery_topic,
+                                              sizeof(s_mqtt.radar_out_discovery_topic),
+                                              "%s/binary_sensor/%s_radar_out/config",
+                                              CONFIG_OTL_MQTT_DISCOVERY_PREFIX,
+                                              s_mqtt.device_id),
+                        TAG,
+                        "MQTT radar OUT discovery topic too long");
     ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.motion_distance_state_topic,
                                               sizeof(s_mqtt.motion_distance_state_topic),
                                               "%s/radar/motion_distance/state",
@@ -1939,6 +2059,25 @@ static esp_err_t otl_mqtt_build_topics(void)
                                               s_mqtt.device_id),
                         TAG,
                         "MQTT stationary distance discovery topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.radar_availability_topic,
+                                              sizeof(s_mqtt.radar_availability_topic),
+                                              "%s/radar/availability/state",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT radar availability topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.radar_uart_state_topic,
+                                              sizeof(s_mqtt.radar_uart_state_topic),
+                                              "%s/radar/uart/state",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT radar UART state topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.radar_uart_state_discovery_topic,
+                                              sizeof(s_mqtt.radar_uart_state_discovery_topic),
+                                              "%s/sensor/%s_radar_uart_state/config",
+                                              CONFIG_OTL_MQTT_DISCOVERY_PREFIX,
+                                              s_mqtt.device_id),
+                        TAG,
+                        "MQTT radar UART discovery topic too long");
 #endif
     ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.ambient_lux_state_topic,
                                               sizeof(s_mqtt.ambient_lux_state_topic),
@@ -2076,6 +2215,25 @@ static esp_err_t otl_mqtt_build_topics(void)
                                               s_mqtt.device_id),
                         TAG,
                         "MQTT stationary max distance discovery topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.radar_absence_timeout_state_topic,
+                                              sizeof(s_mqtt.radar_absence_timeout_state_topic),
+                                              "%s/occupancy/timeout/state",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT occupancy timeout state topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.radar_absence_timeout_command_topic,
+                                              sizeof(s_mqtt.radar_absence_timeout_command_topic),
+                                              "%s/occupancy/timeout/set",
+                                              s_mqtt.topic_root),
+                        TAG,
+                        "MQTT occupancy timeout command topic too long");
+    ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.radar_absence_timeout_discovery_topic,
+                                              sizeof(s_mqtt.radar_absence_timeout_discovery_topic),
+                                              "%s/number/%s_radar_absence_timeout/config",
+                                              CONFIG_OTL_MQTT_DISCOVERY_PREFIX,
+                                              s_mqtt.device_id),
+                        TAG,
+                        "MQTT occupancy timeout discovery topic too long");
 #endif
 #if CONFIG_OTL_CIRCADIAN_ENABLE
     ESP_RETURN_ON_ERROR(otl_mqtt_format_topic(s_mqtt.circadian_enabled_state_topic,
@@ -2471,6 +2629,7 @@ static void otl_mqtt_event_handler(void *handler_args,
             esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.radar_log_command_topic, 1);
             esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.radar_motion_max_distance_command_topic, 1);
             esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.radar_stationary_max_distance_command_topic, 1);
+            esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.radar_absence_timeout_command_topic, 1);
             esp_mqtt_client_subscribe(s_mqtt.client, s_mqtt.occupancy_auto_off_command_topic, 1);
 #endif
             otl_mqtt_cleanup_stale_discovery();

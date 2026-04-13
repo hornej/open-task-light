@@ -36,6 +36,12 @@ typedef enum {
     OTL_CHANGE_SOURCE_HOMEKIT,
 } otl_change_source_t;
 
+typedef enum {
+    OTL_RADAR_UART_STATE_OK = 0,
+    OTL_RADAR_UART_STATE_STALE,
+    OTL_RADAR_UART_STATE_NO_RESPONSE,
+} otl_radar_uart_state_t;
+
 typedef void (*otl_state_listener_fn)(const otl_public_state_t *state,
                                       otl_change_source_t source,
                                       void *ctx);
@@ -49,8 +55,10 @@ typedef struct {
     bool thermal_ntc_hot;
     bool thermal_chip_hot;
     bool radar_motion_detected;
+    bool radar_out_asserted;
     int radar_motion_distance_cm;
     int radar_stationary_distance_cm;
+    otl_radar_uart_state_t radar_uart_state;
     bool wifi_connected;
     int wifi_rssi_dbm;
 } otl_telemetry_t;
@@ -70,6 +78,7 @@ typedef struct {
     bool pwm_duty_logging_enabled;
     bool radar_status_logging_enabled;
     bool occupancy_auto_off_enabled;
+    int radar_absence_timeout_ms;
     int radar_motion_max_distance_cm;
     int radar_stationary_max_distance_cm;
 } otl_runtime_settings_t;
@@ -121,6 +130,7 @@ esp_err_t otl_runtime_set_touch_raw_logging_enabled(bool enabled, otl_change_sou
 esp_err_t otl_runtime_set_pwm_duty_logging_enabled(bool enabled, otl_change_source_t source);
 esp_err_t otl_runtime_set_radar_status_logging_enabled(bool enabled, otl_change_source_t source);
 esp_err_t otl_runtime_set_occupancy_auto_off_enabled(bool enabled, otl_change_source_t source);
+esp_err_t otl_runtime_set_radar_absence_timeout_ms(int timeout_ms, otl_change_source_t source);
 esp_err_t otl_runtime_set_radar_motion_max_distance_cm(int limit_cm, otl_change_source_t source);
 esp_err_t otl_runtime_set_radar_stationary_max_distance_cm(int limit_cm, otl_change_source_t source);
 esp_err_t otl_runtime_set_circadian_enabled(bool enabled, otl_change_source_t source);

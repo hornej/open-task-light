@@ -150,10 +150,23 @@ typedef struct {
 } radar_sample_t;
 
 static radar_sample_t radar_last_sample = {0};
+static uint32_t radar_last_sample_ms = 0;
 
 // Simple UART RX buffer for LD2410 frames
 static uint8_t radar_rx_buf[128];
 static size_t  radar_rx_len = 0;
+static const uint8_t radar_cmd_enter_config[] = {
+    0xFD, 0xFC, 0xFB, 0xFA, 0x04, 0x00, 0xFF, 0x00, 0x01, 0x00, 0x04, 0x03, 0x02, 0x01
+};
+static const uint8_t radar_cmd_disable_bluetooth[] = {
+    0xFD, 0xFC, 0xFB, 0xFA, 0x04, 0x00, 0xA4, 0x00, 0x00, 0x00, 0x04, 0x03, 0x02, 0x01
+};
+static const uint8_t radar_cmd_restart[] = {
+    0xFD, 0xFC, 0xFB, 0xFA, 0x02, 0x00, 0xA3, 0x00, 0x04, 0x03, 0x02, 0x01
+};
+static const uint8_t radar_cmd_end_config[] = {
+    0xFD, 0xFC, 0xFB, 0xFA, 0x02, 0x00, 0xFE, 0x00, 0x04, 0x03, 0x02, 0x01
+};
     
 #endif
 
@@ -669,12 +682,16 @@ static float temp_ratio_user_offset = 0.0f;   // applied on top of circadian_bas
 
 #define OTL_RUNTIME_DEFAULT_OCCUPANCY_AUTO_OFF_ENABLED true
 #if CONFIG_OTL_PRESENCE_SENSOR
+#define OTL_RUNTIME_DEFAULT_RADAR_ABSENCE_TIMEOUT_MS ((uint32_t)CONFIG_OTL_RADAR_ABSENCE_TIMEOUT_MS)
 #define OTL_RUNTIME_DEFAULT_RADAR_MOTION_MAX_DISTANCE_CM ((uint16_t)CONFIG_OTL_RADAR_MOVING_MAX_DISTANCE_CM)
 #define OTL_RUNTIME_DEFAULT_RADAR_STATIONARY_MAX_DISTANCE_CM ((uint16_t)CONFIG_OTL_RADAR_STATIONARY_MAX_DISTANCE_CM)
 #else
+#define OTL_RUNTIME_DEFAULT_RADAR_ABSENCE_TIMEOUT_MS 120000U
 #define OTL_RUNTIME_DEFAULT_RADAR_MOTION_MAX_DISTANCE_CM 300U
 #define OTL_RUNTIME_DEFAULT_RADAR_STATIONARY_MAX_DISTANCE_CM 500U
 #endif
+#define OTL_RUNTIME_RADAR_ABSENCE_TIMEOUT_MIN_MS 1000U
+#define OTL_RUNTIME_RADAR_ABSENCE_TIMEOUT_MAX_MS 600000U
 #define OTL_RUNTIME_RADAR_DISTANCE_MIN_CM 50U
 #define OTL_RUNTIME_RADAR_DISTANCE_MAX_CM 600U
 
@@ -691,6 +708,7 @@ static bool runtime_touch_raw_logging_enabled = OTL_RUNTIME_DEFAULT_TOUCH_RAW_LO
 static bool runtime_pwm_duty_logging_enabled = OTL_RUNTIME_DEFAULT_PWM_DUTY_LOGGING_ENABLED;
 static bool runtime_radar_status_logging_enabled = OTL_RUNTIME_DEFAULT_RADAR_STATUS_LOGGING_ENABLED;
 static bool runtime_occupancy_auto_off_enabled = OTL_RUNTIME_DEFAULT_OCCUPANCY_AUTO_OFF_ENABLED;
+static uint32_t runtime_radar_absence_timeout_ms = OTL_RUNTIME_DEFAULT_RADAR_ABSENCE_TIMEOUT_MS;
 static uint16_t runtime_radar_motion_max_distance_cm = OTL_RUNTIME_DEFAULT_RADAR_MOTION_MAX_DISTANCE_CM;
 static uint16_t runtime_radar_stationary_max_distance_cm = OTL_RUNTIME_DEFAULT_RADAR_STATIONARY_MAX_DISTANCE_CM;
 
@@ -751,8 +769,10 @@ static float telemetry_ambient_lux = NAN;
 static float telemetry_ntc_temp_c = NAN;
 static float telemetry_chip_temp_c = NAN;
 static bool telemetry_radar_motion_detected = false;
+static bool telemetry_radar_out_asserted = false;
 static int telemetry_radar_motion_distance_cm = 0;
 static int telemetry_radar_stationary_distance_cm = 0;
+static otl_radar_uart_state_t telemetry_radar_uart_state = OTL_RADAR_UART_STATE_STALE;
 #if CONFIG_OTL_PRESENCE_SENSOR
 static uint32_t telemetry_radar_last_notify_ms = 0;
 static bool telemetry_radar_notify_pending = false;
@@ -1050,8 +1070,9 @@ static void pwm_log_timer_cb(void *arg)
 
 #if CONFIG_OTL_PRESENCE_SENSOR
 // ---------------------------- Occupancy (LD2410B) ----------------------------
-// The LD2410B's digital OUT pin drives this occupancy state.
-// We use it to fade the light off when the room is empty, and
+// Occupancy is derived from fresh LD2410B UART target reports so stale OUT-pin
+// assertions or latched distance fields cannot hold the light on by themselves.
+// We use that occupancy state to fade the light off when the room is empty, and
 // fade back in to the previous state when occupancy returns.
 static bool radar_occupied        = false;
 static bool occupancy_faded_out   = false;
@@ -1061,9 +1082,55 @@ static float saved_temp_ratio_offset = 0.0f;
 static float saved_temp_ratio     = 0.5f;
 // Detection and hysteresis tuning from menuconfig -> Open Task Light -> Radar detection.
 #define RADAR_PRESENCE_ON_DELAY_MS    ((uint32_t)CONFIG_OTL_RADAR_PRESENCE_ON_DELAY_MS)
-#define RADAR_ABSENCE_TIMEOUT_MS      ((uint32_t)CONFIG_OTL_RADAR_ABSENCE_TIMEOUT_MS)
 #define RADAR_TASK_LOOP_INTERVAL_MS   ((uint32_t)CONFIG_OTL_RADAR_TASK_LOOP_MS)
+#define RADAR_SAMPLE_STALE_TIMEOUT_MS ((uint32_t)CONFIG_OTL_RADAR_SAMPLE_STALE_TIMEOUT_MS)
+#ifdef CONFIG_OTL_RADAR_UART_RECOVERY_INTERVAL_MS
+#define RADAR_UART_RECOVERY_INTERVAL_MS ((uint32_t)CONFIG_OTL_RADAR_UART_RECOVERY_INTERVAL_MS)
+#else
+#define RADAR_UART_RECOVERY_INTERVAL_MS 10000U
+#endif
 #define RADAR_TELEMETRY_NOTIFY_INTERVAL_MS 1000U
+
+static bool radar_sample_is_fresh(uint32_t now_ms)
+{
+    return radar_last_sample.valid &&
+           radar_last_sample_ms != 0 &&
+           (now_ms - radar_last_sample_ms) <= RADAR_SAMPLE_STALE_TIMEOUT_MS;
+}
+
+static otl_radar_uart_state_t radar_uart_state_from_age(uint32_t now_ms)
+{
+    uint32_t sample_age_ms = (radar_last_sample_ms == 0) ? now_ms : (now_ms - radar_last_sample_ms);
+
+    if (radar_sample_is_fresh(now_ms)) {
+        return OTL_RADAR_UART_STATE_OK;
+    }
+    if (sample_age_ms >= RADAR_UART_RECOVERY_INTERVAL_MS) {
+        return OTL_RADAR_UART_STATE_NO_RESPONSE;
+    }
+    return OTL_RADAR_UART_STATE_STALE;
+}
+
+static const char *radar_uart_state_to_string(otl_radar_uart_state_t state)
+{
+    switch (state) {
+        case OTL_RADAR_UART_STATE_OK:
+            return "ok";
+        case OTL_RADAR_UART_STATE_STALE:
+            return "stale";
+        case OTL_RADAR_UART_STATE_NO_RESPONSE:
+            return "no_response";
+        default:
+            return "unknown";
+    }
+}
+
+static void radar_reset_cached_sample(void)
+{
+    radar_rx_len = 0;
+    memset(&radar_last_sample, 0, sizeof(radar_last_sample));
+    radar_last_sample_ms = 0;
+}
 #endif
 
 // ---------------------------- Touch baseline/threshold -------------------------
@@ -1344,6 +1411,7 @@ static void radar_parse_frames(void)
 
         if (s.valid) {
             radar_last_sample = s;
+            radar_last_sample_ms = (uint32_t)(esp_timer_get_time() / 1000);
         }
 
         // Consume this frame from the buffer
@@ -1396,6 +1464,7 @@ static void update_outputs(void);
 #define OTL_RUNTIME_KEY_PWM_DUTY_LOG      "pwm_log"
 #define OTL_RUNTIME_KEY_RADAR_STATUS_LOG  "radar_log"
 #define OTL_RUNTIME_KEY_OCC_AUTO_OFF      "occ_autooff"
+#define OTL_RUNTIME_KEY_RADAR_ABS_TIMEOUT "rad_absto"
 #define OTL_RUNTIME_KEY_RADAR_MOTION_MAX  "rad_movmax"
 #define OTL_RUNTIME_KEY_RADAR_STATIONARY_MAX "rad_stamax"
 
@@ -1482,8 +1551,10 @@ static void otl_telemetry_snapshot_locked(otl_telemetry_t *telemetry)
     telemetry->thermal_ntc_hot = thermal_ntc_hot;
     telemetry->thermal_chip_hot = thermal_chip_hot;
     telemetry->radar_motion_detected = telemetry_radar_motion_detected;
+    telemetry->radar_out_asserted = telemetry_radar_out_asserted;
     telemetry->radar_motion_distance_cm = telemetry_radar_motion_distance_cm;
     telemetry->radar_stationary_distance_cm = telemetry_radar_stationary_distance_cm;
+    telemetry->radar_uart_state = telemetry_radar_uart_state;
     telemetry->wifi_connected = telemetry_wifi_connected;
     telemetry->wifi_rssi_dbm = telemetry_wifi_rssi_dbm;
 }
@@ -1514,6 +1585,7 @@ static void otl_runtime_settings_snapshot_locked(otl_runtime_settings_t *setting
     settings->pwm_duty_logging_enabled = runtime_pwm_duty_logging_enabled;
     settings->radar_status_logging_enabled = runtime_radar_status_logging_enabled;
     settings->occupancy_auto_off_enabled = runtime_occupancy_auto_off_enabled;
+    settings->radar_absence_timeout_ms = (int)runtime_radar_absence_timeout_ms;
     settings->radar_motion_max_distance_cm = (int)runtime_radar_motion_max_distance_cm;
     settings->radar_stationary_max_distance_cm = (int)runtime_radar_stationary_max_distance_cm;
 }
@@ -1525,6 +1597,26 @@ static void otl_event_snapshot_locked(otl_runtime_event_t *event)
     }
 
     *event = s_last_event;
+}
+
+static const char *otl_change_source_to_string(otl_change_source_t source)
+{
+    switch (source) {
+        case OTL_CHANGE_SOURCE_SYSTEM:
+            return "system";
+        case OTL_CHANGE_SOURCE_TOUCH:
+            return "touch";
+        case OTL_CHANGE_SOURCE_OCCUPANCY:
+            return "occupancy";
+        case OTL_CHANGE_SOURCE_CIRCADIAN:
+            return "circadian";
+        case OTL_CHANGE_SOURCE_MQTT:
+            return "mqtt";
+        case OTL_CHANGE_SOURCE_HOMEKIT:
+            return "homekit";
+        default:
+            return "unknown";
+    }
 }
 
 static void otl_state_notify_listeners(const otl_public_state_t *state,
@@ -1649,6 +1741,7 @@ static void otl_runtime_store_defaults_locked(void)
     runtime_pwm_duty_logging_enabled = OTL_RUNTIME_DEFAULT_PWM_DUTY_LOGGING_ENABLED;
     runtime_radar_status_logging_enabled = OTL_RUNTIME_DEFAULT_RADAR_STATUS_LOGGING_ENABLED;
     runtime_occupancy_auto_off_enabled = OTL_RUNTIME_DEFAULT_OCCUPANCY_AUTO_OFF_ENABLED;
+    runtime_radar_absence_timeout_ms = OTL_RUNTIME_DEFAULT_RADAR_ABSENCE_TIMEOUT_MS;
     runtime_radar_motion_max_distance_cm = OTL_RUNTIME_DEFAULT_RADAR_MOTION_MAX_DISTANCE_CM;
     runtime_radar_stationary_max_distance_cm = OTL_RUNTIME_DEFAULT_RADAR_STATIONARY_MAX_DISTANCE_CM;
 }
@@ -1708,6 +1801,27 @@ static esp_err_t otl_runtime_save_u16(const char *key, uint16_t value)
     return err;
 }
 
+static esp_err_t otl_runtime_save_u32(const char *key, uint32_t value)
+{
+    nvs_handle_t handle = 0;
+    esp_err_t err = otl_runtime_nvs_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_open(OTL_RUNTIME_SETTINGS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_set_u32(handle, key, value);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err;
+}
+
 static esp_err_t otl_runtime_save_str(const char *key, const char *value)
 {
     nvs_handle_t handle = 0;
@@ -1728,6 +1842,38 @@ static esp_err_t otl_runtime_save_str(const char *key, const char *value)
     nvs_close(handle);
     return err;
 }
+
+#if CONFIG_OTL_PRESENCE_SENSOR
+static esp_err_t radar_send_command_no_ack(const uint8_t *frame, size_t frame_len)
+{
+    int bytes_written = uart_write_bytes(RADAR_UART_NUM, frame, frame_len);
+    if (bytes_written != (int) frame_len) {
+        return ESP_FAIL;
+    }
+
+    return uart_wait_tx_done(RADAR_UART_NUM, pdMS_TO_TICKS(100));
+}
+
+static esp_err_t radar_restart_blind(void)
+{
+    ESP_RETURN_ON_ERROR(uart_flush_input(RADAR_UART_NUM), "radar", "Failed to flush radar RX before restart");
+    ESP_RETURN_ON_ERROR(radar_send_command_no_ack(radar_cmd_enter_config,
+                                                  sizeof(radar_cmd_enter_config)),
+                        "radar",
+                        "Failed to send radar config command");
+    vTaskDelay(pdMS_TO_TICKS(50));
+    ESP_RETURN_ON_ERROR(radar_send_command_no_ack(radar_cmd_restart,
+                                                  sizeof(radar_cmd_restart)),
+                        "radar",
+                        "Failed to send radar restart command");
+    vTaskDelay(pdMS_TO_TICKS(200));
+    (void)radar_send_command_no_ack(radar_cmd_end_config, sizeof(radar_cmd_end_config));
+    vTaskDelay(pdMS_TO_TICKS(50));
+    ESP_RETURN_ON_ERROR(uart_flush_input(RADAR_UART_NUM), "radar", "Failed to flush radar RX after restart");
+    radar_reset_cached_sample();
+    return ESP_OK;
+}
+#endif
 
 #if CONFIG_OTL_PRESENCE_SENSOR && CONFIG_OTL_RADAR_DISABLE_BLUETOOTH_AT_BOOT
 static esp_err_t radar_bluetooth_disable_required(bool *required)
@@ -1864,19 +2010,6 @@ static esp_err_t radar_disable_bluetooth_if_needed(void)
         return ESP_OK;
     }
 
-    static const uint8_t radar_cmd_enter_config[] = {
-        0xFD, 0xFC, 0xFB, 0xFA, 0x04, 0x00, 0xFF, 0x00, 0x01, 0x00, 0x04, 0x03, 0x02, 0x01
-    };
-    static const uint8_t radar_cmd_disable_bluetooth[] = {
-        0xFD, 0xFC, 0xFB, 0xFA, 0x04, 0x00, 0xA4, 0x00, 0x00, 0x00, 0x04, 0x03, 0x02, 0x01
-    };
-    static const uint8_t radar_cmd_restart[] = {
-        0xFD, 0xFC, 0xFB, 0xFA, 0x02, 0x00, 0xA3, 0x00, 0x04, 0x03, 0x02, 0x01
-    };
-    static const uint8_t radar_cmd_end_config[] = {
-        0xFD, 0xFC, 0xFB, 0xFA, 0x02, 0x00, 0xFE, 0x00, 0x04, 0x03, 0x02, 0x01
-    };
-
     OTL_LOGI("radar", "Disabling LD2410B Bluetooth");
 
     err = radar_send_command_with_ack(radar_cmd_enter_config,
@@ -1913,8 +2046,7 @@ static esp_err_t radar_disable_bluetooth_if_needed(void)
 
     vTaskDelay(pdMS_TO_TICKS(200));
     ESP_RETURN_ON_ERROR(uart_flush_input(RADAR_UART_NUM), "radar", "Failed to flush radar RX after restart");
-    radar_rx_len = 0;
-    memset(&radar_last_sample, 0, sizeof(radar_last_sample));
+    radar_reset_cached_sample();
 
     return otl_runtime_save_u8(OTL_RUNTIME_KEY_RADAR_BT_DISABLED, 1U);
 }
@@ -1932,6 +2064,7 @@ static esp_err_t otl_runtime_settings_init(void)
     bool pwm_duty_logging_enabled = OTL_RUNTIME_DEFAULT_PWM_DUTY_LOGGING_ENABLED;
     bool radar_status_logging_enabled = OTL_RUNTIME_DEFAULT_RADAR_STATUS_LOGGING_ENABLED;
     bool occupancy_auto_off_enabled = OTL_RUNTIME_DEFAULT_OCCUPANCY_AUTO_OFF_ENABLED;
+    uint32_t radar_absence_timeout_ms = OTL_RUNTIME_DEFAULT_RADAR_ABSENCE_TIMEOUT_MS;
     uint16_t radar_motion_max_distance_cm = OTL_RUNTIME_DEFAULT_RADAR_MOTION_MAX_DISTANCE_CM;
     uint16_t radar_stationary_max_distance_cm = OTL_RUNTIME_DEFAULT_RADAR_STATIONARY_MAX_DISTANCE_CM;
     float led_thermal_limit_c = OTL_THERMAL_NTC_HOT_C;
@@ -1940,6 +2073,7 @@ static esp_err_t otl_runtime_settings_init(void)
     uint16_t morning_ramp_minutes = OTL_RUNTIME_DEFAULT_CIRCADIAN_MORNING_RAMP_MINUTES;
     uint8_t stored_u8 = 0;
     uint16_t stored_u16 = 0;
+    uint32_t stored_u32 = 0;
     char stored_time[OTL_RUNTIME_TIME_STR_LEN] = {0};
     size_t stored_len = 0;
     nvs_handle_t handle = 0;
@@ -2002,6 +2136,11 @@ static esp_err_t otl_runtime_settings_init(void)
         if (nvs_get_u8(handle, OTL_RUNTIME_KEY_OCC_AUTO_OFF, &stored_u8) == ESP_OK) {
             occupancy_auto_off_enabled = (stored_u8 != 0);
         }
+        if (nvs_get_u32(handle, OTL_RUNTIME_KEY_RADAR_ABS_TIMEOUT, &stored_u32) == ESP_OK &&
+            stored_u32 >= OTL_RUNTIME_RADAR_ABSENCE_TIMEOUT_MIN_MS &&
+            stored_u32 <= OTL_RUNTIME_RADAR_ABSENCE_TIMEOUT_MAX_MS) {
+            radar_absence_timeout_ms = stored_u32;
+        }
         if (nvs_get_u16(handle, OTL_RUNTIME_KEY_RADAR_MOTION_MAX, &stored_u16) == ESP_OK &&
             stored_u16 >= OTL_RUNTIME_RADAR_DISTANCE_MIN_CM &&
             stored_u16 <= OTL_RUNTIME_RADAR_DISTANCE_MAX_CM) {
@@ -2042,6 +2181,7 @@ static esp_err_t otl_runtime_settings_init(void)
     runtime_pwm_duty_logging_enabled = pwm_duty_logging_enabled;
     runtime_radar_status_logging_enabled = radar_status_logging_enabled;
     runtime_occupancy_auto_off_enabled = occupancy_auto_off_enabled;
+    runtime_radar_absence_timeout_ms = radar_absence_timeout_ms;
     runtime_radar_motion_max_distance_cm = radar_motion_max_distance_cm;
     runtime_radar_stationary_max_distance_cm = radar_stationary_max_distance_cm;
     otl_state_unlock();
@@ -2097,16 +2237,21 @@ bool otl_state_apply_light_update(const otl_light_update_t *update,
                                   otl_change_source_t source)
 {
     bool changed = false;
+    bool power_changed = false;
+    bool prev_led_state = false;
     otl_public_state_t state = {0};
+    char event_message[96] = {0};
 
     if (update == NULL) {
         return false;
     }
 
     otl_state_lock();
+    prev_led_state = led_state;
 
     if (update->set_power && led_state != update->power_on) {
         changed = true;
+        power_changed = true;
         led_state = update->power_on;
     }
 
@@ -2120,6 +2265,7 @@ bool otl_state_apply_light_update(const otl_light_update_t *update,
         }
         if (update->force_on_with_brightness && !led_state) {
             changed = true;
+            power_changed = true;
             led_state = true;
         }
     }
@@ -2141,6 +2287,15 @@ bool otl_state_apply_light_update(const otl_light_update_t *update,
     otl_state_snapshot_locked(&state);
     otl_state_unlock();
     otl_state_notify_listeners(&state, source);
+    if (power_changed && prev_led_state != state.is_on) {
+        snprintf(event_message,
+                 sizeof(event_message),
+                 "Light turned %s via %s%s",
+                 state.is_on ? "ON" : "OFF",
+                 otl_change_source_to_string(source),
+                 state.presence ? " (occupancy ON)" : "");
+        otl_event_emit(OTL_EVENT_LEVEL_INFO, "light", event_message);
+    }
     return true;
 }
 
@@ -2456,6 +2611,39 @@ esp_err_t otl_runtime_set_occupancy_auto_off_enabled(bool enabled, otl_change_so
                                              "Occupancy auto-off enabled",
                                              "Occupancy auto-off disabled",
                                              source);
+}
+
+esp_err_t otl_runtime_set_radar_absence_timeout_ms(int timeout_ms, otl_change_source_t source)
+{
+    otl_runtime_settings_t settings = {0};
+    char event_message[OTL_RUNTIME_EVENT_MESSAGE_LEN] = {0};
+    uint32_t normalized_timeout_ms = (uint32_t)timeout_ms;
+
+    if (timeout_ms < (int)OTL_RUNTIME_RADAR_ABSENCE_TIMEOUT_MIN_MS ||
+        timeout_ms > (int)OTL_RUNTIME_RADAR_ABSENCE_TIMEOUT_MAX_MS) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_RETURN_ON_ERROR(otl_runtime_save_u32(OTL_RUNTIME_KEY_RADAR_ABS_TIMEOUT, normalized_timeout_ms),
+                        "runtime",
+                        "Failed to save radar absence timeout");
+
+    otl_state_lock();
+    if (runtime_radar_absence_timeout_ms == normalized_timeout_ms) {
+        otl_state_unlock();
+        return ESP_OK;
+    }
+    runtime_radar_absence_timeout_ms = normalized_timeout_ms;
+    otl_runtime_settings_snapshot_locked(&settings);
+    otl_state_unlock();
+
+    otl_runtime_settings_notify_listeners(&settings, source);
+    snprintf(event_message,
+             sizeof(event_message),
+             "Updated occupancy off timeout to %lus",
+             (unsigned long)(normalized_timeout_ms / 1000U));
+    otl_event_emit(OTL_EVENT_LEVEL_INFO, "occupancy", event_message);
+    return ESP_OK;
 }
 
 esp_err_t otl_runtime_set_circadian_enabled(bool enabled, otl_change_source_t source)
@@ -2780,8 +2968,10 @@ static bool otl_telemetry_update(float lux,
 
 #if CONFIG_OTL_PRESENCE_SENSOR
 static bool otl_telemetry_update_radar(bool motion_detected,
+                                       bool out_asserted,
                                        int motion_distance_cm,
-                                       int stationary_distance_cm)
+                                       int stationary_distance_cm,
+                                       otl_radar_uart_state_t uart_state)
 {
     bool changed = false;
     bool should_notify = false;
@@ -2800,12 +2990,20 @@ static bool otl_telemetry_update_radar(bool motion_detected,
         telemetry_radar_motion_detected = motion_detected;
         changed = true;
     }
+    if (telemetry_radar_out_asserted != out_asserted) {
+        telemetry_radar_out_asserted = out_asserted;
+        changed = true;
+    }
     if (telemetry_radar_motion_distance_cm != motion_distance_cm) {
         telemetry_radar_motion_distance_cm = motion_distance_cm;
         changed = true;
     }
     if (telemetry_radar_stationary_distance_cm != stationary_distance_cm) {
         telemetry_radar_stationary_distance_cm = stationary_distance_cm;
+        changed = true;
+    }
+    if (telemetry_radar_uart_state != uart_state) {
+        telemetry_radar_uart_state = uart_state;
         changed = true;
     }
 
@@ -3829,13 +4027,20 @@ static void touch_task(void *arg)
 static void radar_task(void *arg)
 {
     otl_public_state_t state = {0};
-    // Configure initial state from pin level + last_sample on both candidate OUT pins
-    int level15 = gpio_get_level(RADAR_OUT_GPIO);
-    int level14 = gpio_get_level(RADAR_OUT_GPIO_ALT);
-    bool out_state = (level14 == 1) || (level15 == 1);
-    bool moving = radar_last_sample.valid && (radar_last_sample.targetType & 0x01);
-    bool stationary = radar_last_sample.valid && (radar_last_sample.targetType & 0x02);
-    bool initial_presence = out_state || moving || stationary;
+    // Use the same fresh-UART criteria at startup that we use in the main
+    // loop so a sticky OUT pin cannot boot the light into a false occupied
+    // state before the first real radar frame arrives.
+    uint32_t initial_now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    bool initial_sample_fresh = radar_sample_is_fresh(initial_now_ms);
+    bool moving = initial_sample_fresh &&
+                  ((radar_last_sample.targetType & 0x01u) != 0) &&
+                  (radar_last_sample.movingDist > 0) &&
+                  (radar_last_sample.movingDist <= runtime_radar_motion_max_distance_cm);
+    bool stationary = initial_sample_fresh &&
+                      ((radar_last_sample.targetType & 0x02u) != 0) &&
+                      (radar_last_sample.staticDist > 0) &&
+                      (radar_last_sample.staticDist <= runtime_radar_stationary_max_distance_cm);
+    bool initial_presence = moving || stationary;
     otl_state_lock();
     radar_occupied = initial_presence;
     otl_state_unlock();
@@ -3843,6 +4048,8 @@ static void radar_task(void *arg)
 
     uint32_t last_log_ms      = 0;
     uint32_t last_presence_ms = esp_timer_get_time() / 1000;
+    uint32_t last_uart_recovery_attempt_ms = 0;
+    otl_radar_uart_state_t last_uart_state = radar_uart_state_from_age(initial_now_ms);
     uint32_t presence_candidate_since_ms = 0;
     bool     presence_candidate_active   = false;
 
@@ -3862,32 +4069,73 @@ static void radar_task(void *arg)
             }
         }
 
-        // 2) Evaluate presence based on OUT pins + moving/static flags within range
+        // 2) Sample OUT pins for diagnostics, then evaluate presence from fresh
+        // UART target reports that are within the configured distance windows.
         int out15_level = gpio_get_level(RADAR_OUT_GPIO);
         int out14_level = gpio_get_level(RADAR_OUT_GPIO_ALT);
-        out_state = (out14_level == 1) || (out15_level == 1);
+        bool out_asserted = (out14_level > 0) || (out15_level > 0);
 
-        // Consider moving targets as "near" only within RADAR_MOVING_NEAR_MAX_CM,
-        // and stationary targets as "near" within RADAR_PRESENCE_MAX_DIST_CM.
-        // The light will only turn off once BOTH movDist and statDist are
-        // beyond these ranges (or no valid distances are reported), and this
-        // condition has held for RADAR_ABSENCE_TIMEOUT_MS.
-        moving = radar_last_sample.valid &&
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        bool sample_fresh = radar_sample_is_fresh(now_ms);
+        bool target_moving = sample_fresh &&
+                             ((radar_last_sample.targetType & 0x01u) != 0);
+        bool target_stationary = sample_fresh &&
+                                 ((radar_last_sample.targetType & 0x02u) != 0);
+        uint32_t sample_age_ms = (radar_last_sample_ms == 0) ? now_ms : (now_ms - radar_last_sample_ms);
+        otl_radar_uart_state_t uart_state = radar_uart_state_from_age(now_ms);
+
+        if (!sample_fresh &&
+            sample_age_ms >= RADAR_UART_RECOVERY_INTERVAL_MS &&
+            (last_uart_recovery_attempt_ms == 0 ||
+             (now_ms - last_uart_recovery_attempt_ms) >= RADAR_UART_RECOVERY_INTERVAL_MS)) {
+            OTL_LOGW("radar",
+                     "No fresh UART sample for %u ms; attempting blind LD2410 restart",
+                     (unsigned)sample_age_ms);
+            esp_err_t restart_err = radar_restart_blind();
+            if (restart_err != ESP_OK) {
+                OTL_LOGW("radar", "Blind LD2410 restart failed: %s", esp_err_to_name(restart_err));
+            } else {
+                OTL_LOGI("radar", "Blind LD2410 restart command sent");
+            }
+            last_uart_recovery_attempt_ms = now_ms;
+            sample_fresh = false;
+            target_moving = false;
+            target_stationary = false;
+        }
+
+        if (uart_state != last_uart_state) {
+            if (uart_state == OTL_RADAR_UART_STATE_NO_RESPONSE) {
+                otl_event_emit(OTL_EVENT_LEVEL_WARNING,
+                               "radar",
+                               "Radar UART no response");
+            } else if (uart_state == OTL_RADAR_UART_STATE_OK &&
+                       last_uart_state != OTL_RADAR_UART_STATE_OK) {
+                otl_event_emit(OTL_EVENT_LEVEL_INFO,
+                               "radar",
+                               "Radar UART recovered");
+            }
+            last_uart_state = uart_state;
+        }
+
+        // Count presence only from fresh UART frames whose target bits are
+        // still asserted. LD2410 distance fields can remain non-zero briefly
+        // after targetType clears, so distance values alone are not enough.
+        moving = target_moving &&
                  (radar_last_sample.movingDist > 0) &&
                  (radar_last_sample.movingDist <= runtime_radar_motion_max_distance_cm);
-        stationary = radar_last_sample.valid &&
+        stationary = target_stationary &&
                      (radar_last_sample.staticDist > 0) &&
                      (radar_last_sample.staticDist <= runtime_radar_stationary_max_distance_cm);
 
-        // Presence is based solely on distances (movDist/statDist) within the
+        // Presence is based on fresh target bits plus distances within the
         // configured range. We do NOT use the OUT pin for dimming, since it
         // can stay high even when the person has left the near field.
         bool new_presence = moving || stationary;
         (void)otl_telemetry_update_radar(moving,
-                                         radar_last_sample.valid ? (int)radar_last_sample.movingDist : 0,
-                                         radar_last_sample.valid ? (int)radar_last_sample.staticDist : 0);
-
-        uint32_t now_ms = esp_timer_get_time() / 1000;
+                                         out_asserted,
+                                         target_moving ? (int)radar_last_sample.movingDist : 0,
+                                         target_stationary ? (int)radar_last_sample.staticDist : 0,
+                                         uart_state);
 
         // Update last_presence_ms whenever we see presence, and track how long
         // continuous presence has been observed for "turn-on" hysteresis.
@@ -3905,9 +4153,13 @@ static void radar_task(void *arg)
         // even if presence does not change.
         if (now_ms - last_log_ms > 2000) {
             otl_state_get_public(&state);
-            OTL_LOG_RADARI("presence=%s OUT14=%d OUT15=%d moving=%d stationary=%d movDist=%ucm statDist=%ucm",
+            OTL_LOG_RADARI("presence=%s uart=%s fresh=%d age=%ums OUT14=%d OUT15=%d target=0x%02x near_move=%d near_stat=%d movDist=%ucm statDist=%ucm",
                            (state.presence ? "ON" : "OFF"),
+                           radar_uart_state_to_string(uart_state),
+                           sample_fresh ? 1 : 0,
+                           (unsigned)sample_age_ms,
                            out14_level, out15_level,
+                           (unsigned)radar_last_sample.targetType,
                            moving ? 1 : 0, stationary ? 1 : 0,
                            (unsigned)radar_last_sample.movingDist,
                            (unsigned)radar_last_sample.staticDist);
@@ -3918,7 +4170,7 @@ static void radar_task(void *arg)
         //  - turn ON only after presence has been continuous for
         //    RADAR_PRESENCE_ON_DELAY_MS
         //  - turn OFF only after absence has been continuous for
-        //    RADAR_ABSENCE_TIMEOUT_MS
+        //    runtime_radar_absence_timeout_ms
         otl_state_get_public(&state);
         otl_state_lock();
         currently_occupied = radar_occupied;
@@ -3929,8 +4181,9 @@ static void radar_task(void *arg)
             (now_ms - presence_candidate_since_ms) > RADAR_PRESENCE_ON_DELAY_MS) {
             otl_state_set_presence(true, OTL_CHANGE_SOURCE_OCCUPANCY);
             handle_occupancy_gained();
-        } else if (!new_presence && currently_occupied &&
-                   (now_ms - last_presence_ms) > RADAR_ABSENCE_TIMEOUT_MS) {
+        } else if ((uart_state == OTL_RADAR_UART_STATE_OK) &&
+                   !new_presence && currently_occupied &&
+                   (now_ms - last_presence_ms) > runtime_radar_absence_timeout_ms) {
             otl_state_set_presence(false, OTL_CHANGE_SOURCE_OCCUPANCY);
             handle_occupancy_lost();
         }
